@@ -56,7 +56,7 @@ jobs:
             env NCPU=4 "$@" /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB  minflt %R" $bin /dev/shm/s20 /tmp/out 2>/tmp/err
             echo "== $label: $(grep WALL /tmp/err)"; grep -E 'ms\]' /tmp/err | tr '\n' ' ' | sed 's/  */ /g'; echo
           }
-          for i in 1 2 3 4 5; do
+          for i in 1 2 3 4 5 6 7 8; do
             for s in $SHAS; do
               sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3-)
               run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
