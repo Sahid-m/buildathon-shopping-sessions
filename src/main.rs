@@ -1053,7 +1053,7 @@ fn process_ev_chunk(
             return;
         }
         let ehash = hash64(key128(f[0]));
-        let ingest_raw = ts::parse_ts(f[3]).unwrap_or(i64::MAX);
+        let ingest_raw = ts::parse_ingest(f[3]).unwrap_or(i64::MAX);
         let ing_u = if ingest_raw == i64::MAX {
             ING_MASK
         } else {
@@ -1067,25 +1067,27 @@ fn process_ev_chunk(
                 break 'v;
             }
             let ty = f[4];
-            if ty == b"purchase" {
-                let Some(p) = csv::parse_price(f[6]) else { break 'v };
-                let Some(t) = ts::parse_ts(f[2]) else { break 'v };
-                if t < ws || t >= we || ingest_raw - t > DAY {
-                    break 'v;
-                }
+            let is_p = ty == b"purchase";
+            if !(is_p || ty == b"view" || ty == b"cart") {
+                break 'v;
+            }
+            let mut p = 0;
+            if is_p {
+                let Some(v) = csv::parse_price(f[6]) else { break 'v };
+                p = v;
+            }
+            let Some(t) = ts::parse_ts(f[2]) else { break 'v };
+            if t < ws || t >= we || ingest_raw - t > DAY {
+                break 'v;
+            }
+            if is_p {
                 price = p;
                 cat = match products.get(key128(f[5])) {
                     Some(c) => c as u16,
                     None => unknown_cat,
                 };
-                dt = (t - ws) as u64;
-            } else if ty == b"view" || ty == b"cart" {
-                let Some(t) = ts::parse_ts(f[2]) else { break 'v };
-                if t < ws || t >= we || ingest_raw - t > DAY {
-                    break 'v;
-                }
-                dt = (t - ws) as u64;
             }
+            dt = (t - ws) as u64;
         }
         let p = (ehash >> 56) as usize;
         let uh = hash64(key128(f[1]));

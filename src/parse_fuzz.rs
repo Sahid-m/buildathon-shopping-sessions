@@ -153,3 +153,35 @@ fn fuzz_csv() {
 fn fuzz_ts() {
     check_ts(&mut Rng(0xD1B5_4A32_D192_ED03));
 }
+
+/// `ts::parse_ingest` must equal `ts::parse_ts_ref` on every valid F1 string: every day of
+/// years 1..=9999 in steps, every day of 1960..=2110, with random times and all edge times.
+#[test]
+fn ingest_fast_path() {
+    let mut r = Rng(0x0123_4567_89AB_CDEF);
+    let mut n = 0usize;
+    let years: Vec<i64> = (1960..=2110).chain((1..=9999).step_by(37)).chain([1, 1600, 1900, 2000, 2100, 2400, 9999]).collect();
+    for y in years {
+        for mo in 1..=12 {
+            for d in 1..=31 {
+                let mut times = vec![(0, 0, 0), (23, 59, 59), (12, 0, 0)];
+                for _ in 0..3 {
+                    times.push((r.below(24) as i64, r.below(60) as i64, r.below(60) as i64));
+                }
+                for (h, mi, s) in times {
+                    let st = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+                    let e = ts::parse_ts_ref(st.as_bytes());
+                    if let Some(v) = e {
+                        assert_eq!(ts::parse_ingest(st.as_bytes()), Some(v), "{st}");
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    // Non-F1 inputs fall back to parse_ts.
+    for st in ["1829203731000", "2027-12-18T07:05:50-09:30", "", "2027-12-18 07:05:50Z", "x"] {
+        assert_eq!(ts::parse_ingest(st.as_bytes()), ts::parse_ts(st.as_bytes()), "{st}");
+    }
+    assert!(n > 500_000);
+}
