@@ -187,6 +187,17 @@ impl<T: Copy> List<T> {
         }
     }
 
+    /// Calls `f` on each chunk's records as a raw (pointer, length) pair, in insertion order.
+    /// The chunks belong to this list, so the caller may write through the pointer.
+    #[inline(always)]
+    pub fn for_slices_raw(&self, mut f: impl FnMut(*mut T, usize)) {
+        let n = self.chunks.len();
+        for (i, &(c, l)) in self.chunks.iter().enumerate() {
+            let l = if i + 1 == n { self.cur_len } else { l };
+            f(c as *mut T, l);
+        }
+    }
+
     /// Hands the chunks back to the pool for reuse.
     pub fn release(self, pool: &Pool) {
         let v: Vec<usize> = self.chunks.iter().map(|c| c.0).collect();

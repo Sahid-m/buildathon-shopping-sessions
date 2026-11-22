@@ -739,9 +739,11 @@ fn main() {
         for t in 0..nt {
             s.spawn(move || {
                 let mut tab: Vec<u64> = Vec::new();
-                let mut best: Vec<EvA> = Vec::new();
                 let mut g = ev_c_ref[t].lock().unwrap();
                 let mut st = wc::Stager::<EvC, 8>::new(npc);
+                // Survivors wait in a small ring while their pmap home slot is prefetched.
+                const RING: usize = 32;
+                let mut ring: [*const EvA; RING] = [std::ptr::null(); RING];
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
                     if p >= npa {
@@ -758,30 +760,37 @@ fn main() {
                         tab.resize(cap, 0);
                     }
                     tab[..cap].fill(0);
-                    best.clear();
-                    if best.capacity() < n {
-                        best.reserve(n - best.capacity());
-                    }
 
+                    // Dedup in place: a slot holds a pointer to the current winner (low 48 bits)
+                    // and a 16-bit hash tag (high bits). The losing copy is marked dead by
+                    // setting its dt to INVALID_DT, which the emit pass skips anyway; the
+                    // winner keeps its own dt, so an invalid winner still drops the event.
                     for tv in &parts {
-                        tv.for_slices(|sl| for r in sl {
+                        tv.for_slices_raw(|base, len| for k in 0..len {
+                            let rp = unsafe { base.add(k) };
+                            let r = unsafe { &*rp };
                             let h = r.ehash;
-                            let tag = (h as u32) | 1;
+                            let tag = (h & 0xFFFF) << 48;
                             let mut i = (h >> 16) as usize & mask;
                             loop {
                                 let slot = unsafe { *tab.get_unchecked(i) };
                                 if slot == 0 {
-                                    let idx = best.len() as u64;
-                                    unsafe { *tab.get_unchecked_mut(i) = (tag as u64) | (idx << 32) };
-                                    best.push(*r);
+                                    unsafe { *tab.get_unchecked_mut(i) = tag | rp as u64 };
                                     break;
                                 }
-                                if (slot as u32) == tag {
-                                    let idx = (slot >> 32) as usize;
-                                    let b = unsafe { best.get_unchecked_mut(idx) };
+                                if (slot & 0xFFFF_0000_0000_0000) == tag {
+                                    let bp = (slot & 0x0000_FFFF_FFFF_FFFF) as *mut EvA;
+                                    let b = unsafe { &mut *bp };
                                     if b.ehash == h {
-                                        if r.ingest() < b.ingest() {
-                                            *b = *r;
+                                        let dead = if r.ingest() < b.ingest() {
+                                            unsafe { *tab.get_unchecked_mut(i) = tag | rp as u64 };
+                                            bp
+                                        } else {
+                                            rp
+                                        };
+                                        unsafe {
+                                            (*dead).ts_lo = INVALID_DT as u32;
+                                            (*dead).price_ts_hi |= 0xFF00_0000;
                                         }
                                         break;
                                     }
@@ -790,22 +799,30 @@ fn main() {
                             }
                         });
                     }
+
+                    let mut m = 0usize;
+                    let emit = |r: &EvA, g: &mut Vec<List<EvC>>, st: &mut wc::Stager<EvC, 8>| {
+                        let (pkey, name) = person_of(r.uh, r.user);
+                        st.push(g, pool, (pkey >> pshc) as usize, EvC::new(pkey, name, r.dt(), r.price(), r.cat()));
+                    };
+                    for tv in &parts {
+                        tv.for_slices(|sl| for r in sl {
+                            if r.dt() == INVALID_DT {
+                                continue;
+                            }
+                            prefetch_person(r.uh);
+                            if m >= PF {
+                                emit(unsafe { &*ring[(m - PF) % RING] }, &mut g, &mut st);
+                            }
+                            ring[m % RING] = r;
+                            m += 1;
+                        });
+                    }
+                    for i in m.saturating_sub(PF)..m {
+                        emit(unsafe { &*ring[i % RING] }, &mut g, &mut st);
+                    }
                     for tv in parts {
                         tv.release(pool);
-                    }
-
-                    for i in 0..best.len() {
-                        if i + PF < best.len() {
-                            prefetch_person(best[i + PF].uh);
-                        }
-                        let r = &best[i];
-                        let dt = r.dt();
-                        if dt == INVALID_DT {
-                            continue;
-                        }
-                        let (pkey, name) = person_of(r.uh, r.user);
-                        let price = r.price();
-                        st.push(&mut g, pool, (pkey >> pshc) as usize, EvC::new(pkey, name, dt, price, r.cat()));
                     }
                 }
                 st.finish(&mut g, pool);
