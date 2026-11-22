@@ -3,11 +3,10 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "129036e:x86-64-v3 d2e286a:x86-64-v3"
+  VARIANTS: "d2e286a:x86-64-v3 a29ac81:x86-64-v3 eda5934:x86-64-v3"
 on:
   push:
-    branches: [bench]
-    paths: ['.github/workflows/bench.yml']
+    branches: [evb-bench]
   workflow_dispatch:
     inputs:
       shas:
@@ -63,9 +62,24 @@ jobs:
               run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
             done
           done
+      - name: generate 60M
+        run: |
+          rm -rf /dev/shm/s20
+          tools/generator/target/release/generate --seed 11 --events 60000000 --clicks 15000000 --output /dev/shm/s60 >/dev/null
+          du -sh /dev/shm/s60; free -g
+      - name: time 60M
+        run: |
+          for i in 1 2 3; do
+            for s in $SHAS; do
+              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2)
+              rm -rf /tmp/out
+              NCPU=4 /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB" /tmp/b-$sha-$cpu/target/release/sessions /dev/shm/s60 /tmp/out 2>/tmp/err
+              echo "== 60M $s: $(grep WALL /tmp/err)"; grep -E 'ms\]' /tmp/err | tr '\n' ' ' | sed 's/  */ /g'; echo
+            done
+          done
       - name: check outputs agree
         run: |
           pip install -q pyarrow polars
           set -- $SHAS
-          i=0; for s in "$@"; do i=$((i+1)); sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); rm -rf /tmp/o-$i; mkdir -p /tmp/o-$i; SS_QUIET=1 /tmp/b-$sha-$cpu/target/release/sessions /dev/shm/s20 /tmp/o-$i; done
+          i=0; for s in "$@"; do i=$((i+1)); sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); rm -rf /tmp/o-$i; mkdir -p /tmp/o-$i; SS_QUIET=1 /tmp/b-$sha-$cpu/target/release/sessions /dev/shm/s60 /tmp/o-$i; done
           for j in $(seq 2 $i); do python3 /tmp/src-$(echo $1 | cut -d: -f1)/scripts/compare.py /tmp/o-1 /tmp/o-$j 2>&1 | tail -1; done
