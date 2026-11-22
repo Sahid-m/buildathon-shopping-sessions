@@ -1,20 +1,20 @@
 //! Shopping Sessions pipeline. See README.md for the approach and rules.md for the spec.
 
 mod csv;
+mod io;
 mod keys;
 #[cfg(test)]
 mod parse_fuzz;
 mod pq;
 mod ts;
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use keys::{Key, KeyMap, hash64, key128, mum};
-use memmap2::Mmap;
+use io::Data;
 
 pub const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
@@ -141,17 +141,8 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn map_file(p: &Path) -> Option<Mmap> {
-    let f = File::open(p).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len == 0 {
-        return None;
-    }
-    unsafe { Mmap::map(&f).ok() }
-}
-
 /// Splits every file's data region (after the header line) into chunks of whole lines.
-fn chunks(maps: &[Mmap], target: usize) -> Vec<(usize, usize, usize)> {
+fn chunks(maps: &[Data], target: usize) -> Vec<(usize, usize, usize)> {
     let mut out = vec![];
     for (fi, m) in maps.iter().enumerate() {
         let d: &[u8] = m;
@@ -283,9 +274,10 @@ fn main() {
     log(&t0, "small files");
 
     // map all big files
-    let ev_maps: Vec<Mmap> = list_csv(&data.join("events")).iter().filter_map(|p| map_file(p)).collect();
-    let cl_maps: Vec<Mmap> = list_csv(&data.join("clicks")).iter().filter_map(|p| map_file(p)).collect();
-    let ln_maps: Vec<Mmap> = list_csv(&data.join("links")).iter().filter_map(|p| map_file(p)).collect();
+    let ln_maps: Vec<Data> = io::load_all(&list_csv(&data.join("links")), nt);
+    let ev_maps: Vec<Data> = io::load_all(&list_csv(&data.join("events")), nt);
+    let cl_maps: Vec<Data> = io::load_all(&list_csv(&data.join("clicks")), nt);
+    log(&t0, "read input");
     const CH: usize = 4 << 20;
     let ln_chunks = chunks(&ln_maps, CH);
 
@@ -844,7 +836,7 @@ fn bucket_sort<T: Copy>(
 fn process_ev_chunk(
     ci: usize,
     ev_chunks: &[(usize, usize, usize)],
-    ev_maps: &[Mmap],
+    ev_maps: &[Data],
     products: &KeyMap,
     ws: i64,
     we: i64,
