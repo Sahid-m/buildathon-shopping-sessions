@@ -3,11 +3,10 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "4b93fd0:x86-64-v3 129036e:x86-64-v3 ca71843:x86-64-v3"
+  VARIANTS: "129036e:x86-64-v3 ce89d6a:x86-64-v3 72e3bd1:x86-64-v3"
 on:
   push:
-    branches: [bench]
-    paths: ['.github/workflows/bench.yml']
+    branches: [clinks-bench]
   workflow_dispatch:
     inputs:
       shas:
@@ -15,6 +14,10 @@ on:
         default: "1e589b6 c97bfa7"
 jobs:
   bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        size: [s20, s60]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -28,7 +31,11 @@ jobs:
       - name: generate 20M into tmpfs
         run: |
           cd tools/generator && cargo build --release -q && cd -
-          time tools/generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/s20
+          if [ "${{ matrix.size }}" = s60 ]; then
+            time tools/generator/target/release/generate --seed 11 --events 60000000 --clicks 15000000 --output /dev/shm/s20
+          else
+            time tools/generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/s20
+          fi
           du -sh /dev/shm/s20
       - name: build commits
         run: |
@@ -57,7 +64,7 @@ jobs:
             env NCPU=4 "$@" /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB  minflt %R" $bin /dev/shm/s20 /tmp/out 2>/tmp/err
             echo "== $label: $(grep WALL /tmp/err)"; grep -E 'ms\]' /tmp/err | tr '\n' ' ' | sed 's/  */ /g'; echo
           }
-          for i in 1 2 3 4 5; do
+          R=5; [ "${{ matrix.size }}" = s60 ] && R=3; for i in $(seq $R); do
             for s in $SHAS; do
               sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3-)
               run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
