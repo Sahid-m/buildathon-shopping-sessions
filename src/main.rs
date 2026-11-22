@@ -28,7 +28,7 @@ const NPA_BITS: u32 = 8;
 /// Person partition count bounds (log2) for phase C. The count scales with input so a
 /// partition stays near EV_PER_PART events and its 4096 buckets hold under one person each.
 const NPC_BITS_MIN: u32 = 8;
-const NPC_BITS_MAX: u32 = 10;
+const NPC_BITS_MAX: u32 = 8; // 1024 person partitions scored slower on the 1 MB-L2 scorer
 const EV_PER_PART: usize = 20_000;
 const ING_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 const INVALID_DT: u64 = 0x0000_00FF_FFFF_FFFF;
