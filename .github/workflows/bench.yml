@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "c97bfa7:x86-64-v3 c97bfa7:x86-64-v4 24de0d7:x86-64-v3 24de0d7:x86-64-v4"
+  VARIANTS: "c97bfa7:x86-64-v3 24de0d7:x86-64-v3"
 on:
   push:
     branches: [bench]
@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
       - name: machine
         run: |
-          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Flags' | cut -c1-200
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread'; grep -o 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' '
           cat /sys/kernel/mm/transparent_hugepage/enabled; free -g; uname -r
       - name: generate 20M into tmpfs
         run: |
