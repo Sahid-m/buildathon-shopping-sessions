@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use keys::{Key, KeyMap, idhash, key128, mum};
+use keys::{Key, KeyMap, hash64, key128, mum};
 use memmap2::Mmap;
 
 pub const DAY: i64 = 86_400_000;
@@ -47,8 +47,8 @@ impl Str {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct EvA {
-    ehash: u64,        // 8B: idhash(event_id)
-    uh: u64,           // 8B: idhash(user_id), computed while the line is hot
+    ehash: u64,        // 8B: hash64(key128(event_id))
+    uh: u64,           // 8B: hash64(key128(user_id)), computed while the line is hot
     ingest_cat: u64,   // 8B: low 52b = biased ingest, high 12b = cat
     user: Str,         // 8B
     ts_lo: u32,        // 4B: low 32b of (ts - ws)
@@ -443,7 +443,7 @@ fn main() {
                 if !e.k.is_zero() {
                     let r = find(&mut parent, e.v as u32) as usize;
                     let raw = ids[r].0;
-                    let h_nz = idhash(ids[e.v as usize].get()) | 1;
+                    let h_nz = hash64(e.k) | 1;
                     let mut i = (h_nz >> shift) as usize;
                     while unsafe { pmap_ptr.get_unchecked(i).0 } != 0 {
                         i = (i + 1) & mask;
@@ -551,7 +551,7 @@ fn main() {
                 return;
             }
             let Some(camp) = campaigns.get(key128(f[2])) else { return };
-            let uh = idhash(f[1]);
+            let uh = hash64(key128(f[1]));
             tmp.push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
         });
         let mut g = cl_c[t].lock().unwrap();
@@ -1050,7 +1050,7 @@ fn process_ev_chunk(
         if f[0].is_empty() {
             return;
         }
-        let ehash = idhash(f[0]);
+        let ehash = hash64(key128(f[0]));
         let ingest_raw = ts::parse_ingest(f[3]).unwrap_or(i64::MAX);
         let ing_u = if ingest_raw == i64::MAX {
             ING_MASK
@@ -1088,7 +1088,7 @@ fn process_ev_chunk(
             dt = (t - ws) as u64;
         }
         let p = (ehash >> 56) as usize;
-        let uh = idhash(f[1]);
+        let uh = hash64(key128(f[1]));
         st.push(g, p, EvA {
             ehash,
             uh,

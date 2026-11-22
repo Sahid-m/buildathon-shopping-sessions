@@ -185,37 +185,3 @@ fn ingest_fast_path() {
     }
     assert!(n > 500_000);
 }
-
-/// `keys::idhash`: equal bytes give equal hashes wherever they sit (page ends, inside larger
-/// buffers, after copying), and distinct IDs of all lengths 0..=64 do not collide.
-#[test]
-fn idhash_stable_and_spread() {
-    use crate::keys::idhash;
-    use std::collections::HashMap;
-    let mut r = Rng(0xFEED_FACE_CAFE_BEEF);
-    // A buffer spanning several pages; place each ID at random offsets, including the last
-    // bytes before a page boundary, with random junk after it.
-    let mut buf = vec![0u8; 4096 * 4];
-    let mut seen: HashMap<u64, Vec<u8>> = HashMap::new();
-    for i in 0..200_000 {
-        let n = (r.below(65)) as usize;
-        let id: Vec<u8> = (0..n).map(|_| b"0123456789abcdefghijklmnopqrstuvwxyzU_"[r.below(38) as usize]).collect();
-        let h0 = idhash(&id);
-        for _ in 0..3 {
-            let off = if i % 2 == 0 { 4096 * (1 + r.below(2) as usize) - n - r.below(17) as usize } else { r.below(4096 * 3) as usize };
-            for b in buf.iter_mut().skip(off + n).take(32) { *b = r.next() as u8; }
-            buf[off..off + n].copy_from_slice(&id);
-            assert_eq!(idhash(&buf[off..off + n]), h0);
-        }
-        if let Some(prev) = seen.insert(h0, id.clone()) {
-            assert_eq!(prev, id, "collision");
-        }
-    }
-    // Strings that differ only in trailing NUL bytes or length must still differ.
-    let z: Vec<u64> = (0..=40).map(|n| idhash(&vec![0u8; n])).collect();
-    for i in 0..z.len() { for j in 0..i { assert_ne!(z[i], z[j]); } }
-    // Top byte spreads over partitions.
-    let mut bins = [0usize; 256];
-    for i in 0..256_000u32 { bins[(idhash(format!("u{i:08x}").as_bytes()) >> 56) as usize] += 1; }
-    assert!(bins.iter().all(|&c| c > 700 && c < 1300), "{bins:?}");
-}
