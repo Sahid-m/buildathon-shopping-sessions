@@ -4,7 +4,7 @@ on:
   push:
     branches: [prof]
 env:
-  SHA: c97bfa7
+  SHA: 2921d31
 jobs:
   profile:
     runs-on: ubuntu-latest
@@ -26,12 +26,12 @@ jobs:
           (cd /tmp/v1 && cargo build --release -q)
       - name: phases
         run: |
-          for b in v3 v1 v3 v1; do for n in 1 4; do rm -rf /tmp/o; echo "== $b NCPU=$n: $(NCPU=$n /tmp/$b/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | tr '\n' ' ' | sed 's/  */ /g')"; done; done
+          for b in v3 v3; do for n in 1 4; do rm -rf /tmp/o; echo "== $b NCPU=$n: $(NCPU=$n /tmp/$b/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | tr '\n' ' ' | sed 's/  */ /g')"; done; done
       - name: perf
         run: |
           P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); P=${P:-perf}
           rm -rf /tmp/o; NCPU=1 $P record -F 2000 -g -o /tmp/perf.data /tmp/v3/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | tail -2
           $P report -i /tmp/perf.data --no-children --percent-limit 0.7 --stdio --sort sym 2>/dev/null | grep -v '^$' | grep -E '^ +[0-9]' | head -40
           echo "== srcline"
-          $P report -i /tmp/perf.data --no-children --percent-limit 0.7 --stdio --sort srcline -g none 2>/dev/null | grep -E '^ +[0-9]' | head -60
+          $P report -i /tmp/perf.data --no-children --percent-limit 0.5 --stdio --sort srcline -g none 2>/dev/null | grep -E '^ +[0-9]' | head -80
           rm -rf /tmp/o; NCPU=1 $P stat -e cycles,instructions,branch-misses,cache-misses,page-faults,dTLB-load-misses /tmp/v3/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | grep -E 'cycles|instr|miss|fault|elapsed'
