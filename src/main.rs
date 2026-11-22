@@ -1021,66 +1021,87 @@ fn bucket_sort<T: Copy>(
         *e = n;
         n += c;
     }
-    let Scratch { scat, out, keys, pks } = sc;
-    scat.clear();
-    scat.reserve(n);
-    let dst = scat.as_mut_ptr();
+    let Scratch { scat, out, keys, pks, gat } = sc;
+    // Two scatter passes instead of one 4096-way scatter over a buffer bigger than L2: first
+    // 16 ways by the top 4 bucket bits into `out` (few write streams), then each 1/16 slice
+    // 256 ways into its own range of `scat`, which stays cache-resident while its buckets are
+    // sorted in place.
+    let mut sub = [0usize; 17];
+    for s in 0..16 {
+        sub[s + 1] = if s == 15 { n } else { ends[(s + 1) << 8] };
+    }
+    out.clear();
+    out.reserve(n);
+    let tmp = out.as_mut_ptr();
+    let mut so = [0usize; 16];
+    so.copy_from_slice(&sub[..16]);
     for w in &workers {
         w.for_slices(|sl| {
             for v in sl {
-                let o = &mut ends[bucket(v)];
-                // Prefix sums give each bucket a disjoint range with one slot per input.
-                unsafe { dst.add(*o).write(*v) };
+                let o = &mut so[bucket(v) >> 8];
+                // Prefix sums give each slice a disjoint range with one slot per input.
+                unsafe { tmp.add(*o).write(*v) };
                 *o += 1;
             }
         });
     }
-    unsafe { scat.set_len(n) };
+    unsafe { out.set_len(n) };
     for w in workers {
         w.release(pool);
     }
-    // Each bucket is sorted in place (sorted buckets stay where they are in `scat`), so no
-    // second partition-sized buffer is written.
-    let mut start = 0;
-    for &end in ends.iter() {
-        let b = &mut scat[start..end];
-        start = end;
-        if b.len() <= SMALL {
-            // Stable insertion sort by (key, tsoff): ties keep input order, as the packed
-            // keys do.
-            for i in 1..b.len() {
-                let v = b[i];
-                let kv = (key(&v), tsoff(&v));
-                let mut j = i;
-                while j > 0 && (key(&b[j - 1]), tsoff(&b[j - 1])) > kv {
-                    b[j] = b[j - 1];
-                    j -= 1;
-                }
-                b[j] = v;
-            }
-            continue;
+    scat.clear();
+    scat.reserve(n);
+    let dst = scat.as_mut_ptr();
+    let starts = ends.clone();
+    for s in 0..16 {
+        for v in &out[sub[s]..sub[s + 1]] {
+            let o = &mut ends[bucket(v)];
+            unsafe { dst.add(*o).write(*v) };
+            *o += 1;
         }
-        out.clear();
-        if sort_bucket(b, &key, &tsoff, tb, bsh, keys, pks, out) {
-            b.copy_from_slice(out);
-        } else {
-            b.sort_unstable_by(cmp);
+        let sl = unsafe { std::slice::from_raw_parts_mut(dst.add(sub[s]), sub[s + 1] - sub[s]) };
+        let base = sub[s];
+        for bi in s << 8..(s + 1) << 8 {
+            let b = &mut sl[starts[bi] - base..ends[bi] - base];
+            if b.len() <= SMALL {
+                // Stable insertion sort by (key, tsoff): ties keep input order, as the
+                // packed keys do.
+                for i in 1..b.len() {
+                    let v = b[i];
+                    let kv = (key(&v), tsoff(&v));
+                    let mut j = i;
+                    while j > 0 && (key(&b[j - 1]), tsoff(&b[j - 1])) > kv {
+                        b[j] = b[j - 1];
+                        j -= 1;
+                    }
+                    b[j] = v;
+                }
+                continue;
+            }
+            gat.clear();
+            if sort_bucket(b, &key, &tsoff, tb, bsh, keys, pks, gat) {
+                b.copy_from_slice(gat);
+            } else {
+                b.sort_unstable_by(cmp);
+            }
         }
     }
+    unsafe { scat.set_len(n) };
 }
 
 /// Per-thread buffers for `bucket_sort`, reused across partitions to avoid fresh page faults.
-/// `scat` holds the sorted partition; `out` is one bucket's gather buffer.
+/// `scat` holds the sorted partition, `out` the first scatter pass, `gat` one bucket's gather.
 struct Scratch<T> {
     scat: Vec<T>,
     out: Vec<T>,
     keys: Vec<u64>,
     pks: Vec<u64>,
+    gat: Vec<T>,
 }
 
 impl<T> Scratch<T> {
     fn new() -> Self {
-        Scratch { scat: vec![], out: vec![], keys: vec![], pks: vec![] }
+        Scratch { scat: vec![], out: vec![], keys: vec![], pks: vec![], gat: vec![] }
     }
 }
 
