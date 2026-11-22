@@ -249,3 +249,27 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     }
     parse_f3(b)
 }
+
+/// `ingest_ts`, which rules.md guarantees is valid F1: a 20-byte `..T..Z` field is converted
+/// without calendar or range checks; anything else goes through `parse_ts`.
+#[inline(always)]
+pub fn parse_ingest(b: &[u8]) -> Option<i64> {
+    if b.len() == 20 && (b[10] == b'T') & (b[19] == b'Z') {
+        const LO: u64 = 0x0F0F_0F0F_0F0F_0F0F;
+        // Each byte becomes (digit_i * 10 + digit_{i+1}); no carries since nibbles <= 15.
+        let pair = |w: u64| {
+            let x = w & LO;
+            x.wrapping_mul(10).wrapping_add(x >> 8)
+        };
+        let a = pair(rd8(b, 0)); // "YYYY-MM-": byte0 = YY(hi), byte2 = YY(lo)
+        let m = pair(rd8(b, 4)); // "-MM-DDTH": byte1 = MM, byte4 = DD
+        let c = pair(rd8(b, 11)); // "HH:MM:SS": byte0 = HH, byte3 = MM, byte6 = SS
+        let y = byte(a, 0) * 100 + byte(a, 2);
+        let mo = byte(m, 1);
+        let d = byte(m, 4);
+        let sod = byte(c, 0) * 3600 + byte(c, 3) * 60 + byte(c, 6);
+        let days = days_from_civil(y, mo, d);
+        return Some((days * 86_400 + sod) * 1000);
+    }
+    parse_ts(b)
+}
