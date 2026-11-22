@@ -14,6 +14,12 @@ impl<T: Copy, const K: usize> Stager<T, K> {
         Stager { buf: (0..np).map(|_| [MaybeUninit::uninit(); K]).collect(), cnt: vec![0; np] }
     }
 
+    /// Records staged (not yet in `out`) for partition `p`.
+    #[inline(always)]
+    pub fn pending(&self, p: usize) -> usize {
+        unsafe { *self.cnt.get_unchecked(p) as usize }
+    }
+
     #[inline(always)]
     pub fn push(&mut self, out: &mut [Vec<T>], p: usize, v: T) {
         let c = unsafe { self.cnt.get_unchecked_mut(p) };
