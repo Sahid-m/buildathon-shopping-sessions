@@ -151,13 +151,20 @@ impl ClC {
     }
 }
 
-pub struct UdRow {
-    pub name: Str,
-    pub day: i32,
-    pub sessions: i64,
-    pub events: i64,
-    pub revenue: i64,
-    pub top: Option<u16>,
+struct UdRow {
+    name: Str,
+    day: i32,
+    sessions: i64,
+    events: i64,
+    revenue: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+struct CampCell {
+    rev: u64,
+    ses: u32,
+    pur: u32,
 }
 
 /// `c_<n>` with n in canonical decimal (no leading zeros) and n < 65536.
@@ -275,6 +282,27 @@ fn par_for<F: Fn(usize, usize) + Sync>(nt: usize, n: usize, f: F) {
                     }
                     f(t, i);
                 }
+            });
+        }
+    });
+}
+
+/// Like `par_for`, on exactly `nt` threads; each thread runs `fin(t)` once it finds no more
+/// work, while the others may still be running.
+fn par_for_fin<F: Fn(usize, usize) + Sync, G: Fn(usize) + Sync>(nt: usize, n: usize, f: F, fin: G) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for t in 0..nt {
+            let (f, fin, next) = (&f, &fin, &next);
+            s.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    f(t, i);
+                }
+                fin(t);
             });
         }
     });
@@ -796,32 +824,49 @@ fn main() {
     // Bits for a timestamp offset from the click window start (covers events too).
     let tb = 64 - ((we - cws - 1).max(1) as u64).leading_zeros();
     struct TOut {
-        ud: Vec<UdRow>,
-        camp: Vec<[i64; 4]>,
+        ud: pq::UdCols,
+        // Per (campaign, day): revenue, sessions, purchasing sessions. 16 bytes per cell
+        // (instead of 32) keeps this randomly-hit table at half the L2 footprint.
+        camp: Vec<CampCell>,
+        assisted: Vec<u32>,
     }
+    // Rough upper estimate of rows per thread (one row per person-day, ~85 B per event line);
+    // the vectors still grow if it is short.
+    let est_rows = total_ev_bytes / 85 / nt.max(1) / 3 + 1024;
     let touts: Vec<Mutex<TOut>> = (0..nt)
-        .map(|_| Mutex::new(TOut { ud: Vec::with_capacity(65536), camp: vec![[0; 4]; (ncamp + 1) * ndays] }))
+        .map(|_| {
+            Mutex::new(TOut {
+                ud: pq::UdCols::with_capacity(est_rows),
+                camp: vec![CampCell::default(); (ncamp + 1) * ndays],
+                assisted: vec![0; (ncamp + 1) * ndays],
+            })
+        })
         .collect();
+    let cat_strs: &[&[u8]] = &cat_names;
     let scratch: Vec<Mutex<(Scratch<EvC>, Scratch<ClC>)>> =
         (0..nt).map(|_| Mutex::new((Scratch::new(), Scratch::new()))).collect();
     let order = lpt_order(&ev_c, &cl_c, npc);
     // Phase C buckets: the 12 hash bits just below the partition bits.
     let bsh = pshc - 12;
-    par_for(nt, npc, |t, pi| {
+    let ud_dir = out.join("user_daily");
+    let cd_dir = out.join("campaign_daily");
+    std::fs::create_dir_all(&ud_dir).unwrap();
+    std::fs::create_dir_all(&cd_dir).unwrap();
+    par_for_fin(nt, npc, |t, pi| {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
         bucket_sort(&ev_c, p, bsh, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc, pool);
-        let evs = &esc.out;
+        let evs = &esc.scat;
         bucket_sort(&cl_c, p, bsh, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.dt().cmp(&b.dt()))
                 .then_with(|| a.cid.get().cmp(b.cid.get()))
         }, csc, pool);
-        let cls = &mut csc.out;
+        let cls = &mut csc.scat;
         // The packed sort keeps equal (pkey, ts) clicks in input order; order those runs by
         // click_id so the dedup below sees copies side by side.
         let mut a = 0;
@@ -838,7 +883,7 @@ fn main() {
         cls.dedup_by(|a, b| a.pkey == b.pkey && a.dt() == b.dt() && a.cid.get() == b.cid.get());
 
         let mut g = touts[t].lock().unwrap();
-        let TOut { ud, camp } = &mut *g;
+        let TOut { ud, camp, assisted } = &mut *g;
         let mut cnt = vec![0u32; ncamp];
         let mut pos = vec![0u32; ncamp];
         let mut active: Vec<u16> = vec![];
@@ -846,8 +891,20 @@ fn main() {
         let mut cat_touched: Vec<u16> = vec![];
         let mut ci = 0usize;
         let mut i = 0usize;
+        // User names are random reads into the input; prefetch each person's name once, about
+        // NAME_PF events ahead of where it is copied to the output.
+        let mut pf = 0usize;
         while i < evs.len() {
             let pk = evs[i].pkey;
+            let pf_end = (i + NAME_PF).min(evs.len());
+            while pf < pf_end {
+                if pf == 0 || evs[pf].pkey != evs[pf - 1].pkey {
+                    let nm = evs[pf].name.get();
+                    csv::prefetch(nm.as_ptr());
+                    csv::prefetch(nm.as_ptr().wrapping_add(nm.len().saturating_sub(1)));
+                }
+                pf += 1;
+            }
             let mut j = i;
             while j < evs.len() && evs[j].pkey == pk {
                 j += 1;
@@ -869,9 +926,9 @@ fn main() {
                 let day = start.div_euclid(DAY) as i32;
                 let di = (start.div_euclid(DAY) - day0) as usize;
                 if cur.as_ref().map(|c| c.day != day).unwrap_or(false) {
-                    let mut row = cur.take().unwrap();
-                    row.top = top_cat(&mut catsum, &mut cat_touched);
-                    ud.push(row);
+                    let row = cur.take().unwrap();
+                    let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
+                    ud.push(row.name.get(), row.day, row.sessions, row.events, row.revenue, top);
                 }
                 let mut last = start;
                 let mut m = k;
@@ -892,7 +949,7 @@ fn main() {
                     m += 1;
                 }
                 let nev = (m - k) as i64;
-                let row = cur.get_or_insert(UdRow { name, day, sessions: 0, events: 0, revenue: 0, top: None });
+                let row = cur.get_or_insert(UdRow { name, day, sessions: 0, events: 0, revenue: 0 });
                 row.sessions += 1;
                 row.events += nev;
                 row.revenue += rev;
@@ -929,21 +986,21 @@ fn main() {
                         }
                     }
                     for &c in &active {
-                        camp[c as usize * ndays + di][3] += 1;
+                        assisted[c as usize * ndays + di] += 1;
                     }
                     pc[b].camp() as usize
                 } else {
                     ncamp
                 };
                 let r = &mut camp[credited * ndays + di];
-                r[0] += 1;
-                r[1] += purchased as i64;
-                r[2] += rev;
+                r.rev += rev as u64;
+                r.ses += 1;
+                r.pur += purchased as u32;
                 k = m;
             }
-            if let Some(mut row) = cur.take() {
-                row.top = top_cat(&mut catsum, &mut cat_touched);
-                ud.push(row);
+            if let Some(row) = cur.take() {
+                let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
+                ud.push(row.name.get(), row.day, row.sessions, row.events, row.revenue, top);
             }
             for q in lo..hi {
                 cnt[pc[q].camp() as usize] = 0;
@@ -951,30 +1008,25 @@ fn main() {
             active.clear();
             i = j;
         }
+    }, |t| {
+        // This thread's user_daily rows are complete: write them while others finish.
+        let g = touts[t].lock().unwrap();
+        pq::write_user_daily(&ud_dir.join(format!("part-{t}.parquet")), &g.ud);
     });
-    log(&t0, "phase C");
+    log(&t0, "phase C"); // includes the user_daily writes
 
     // ---- output ----
     let touts: Vec<TOut> = touts.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut camp_tot = vec![[0i64; 4]; (ncamp + 1) * ndays];
     for to in &touts {
-        for (a, b) in camp_tot.iter_mut().zip(to.camp.iter()) {
-            for x in 0..4 {
-                a[x] += b[x];
-            }
+        for ((a, b), &x) in camp_tot.iter_mut().zip(to.camp.iter()).zip(to.assisted.iter()) {
+            a[0] += b.ses as i64;
+            a[1] += b.pur as i64;
+            a[2] += b.rev as i64;
+            a[3] += x as i64;
         }
     }
-    let ud_dir = out.join("user_daily");
-    let cd_dir = out.join("campaign_daily");
-    std::fs::create_dir_all(&ud_dir).unwrap();
-    std::fs::create_dir_all(&cd_dir).unwrap();
-    let cat_strs: Vec<&[u8]> = cat_names.clone();
-    std::thread::scope(|s| {
-        for (ti, to) in touts.iter().enumerate() {
-            let path = ud_dir.join(format!("part-{ti}.parquet"));
-            let cat_strs = &cat_strs;
-            s.spawn(move || pq::write_user_daily(&path, &to.ud, cat_strs));
-        }
+    {
         let mut rows: Vec<pq::CdRow> = vec![];
         for c in 0..=ncamp {
             for d in 0..ndays {
@@ -995,7 +1047,7 @@ fn main() {
             }
         }
         pq::write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows);
-    });
+    }
     log(&t0, "done");
     // Skip freeing the large buffers; the OS reclaims them at exit.
     std::process::exit(0);
@@ -1076,39 +1128,38 @@ fn bucket_sort<T: Copy>(
     for w in workers {
         w.release(pool);
     }
-    out.clear();
-    out.reserve(n);
+    // Each bucket is sorted in place (sorted buckets stay where they are in `scat`), so no
+    // second partition-sized buffer is written.
     let mut start = 0;
     for &end in ends.iter() {
-        let b = &scat[start..end];
+        let b = &mut scat[start..end];
         start = end;
         if b.len() <= SMALL {
             // Stable insertion sort by (key, tsoff): ties keep input order, as the packed
             // keys do.
-            let o = out.len();
-            out.extend_from_slice(b);
-            let t = &mut out[o..];
-            for i in 1..t.len() {
-                let v = t[i];
+            for i in 1..b.len() {
+                let v = b[i];
                 let kv = (key(&v), tsoff(&v));
                 let mut j = i;
-                while j > 0 && (key(&t[j - 1]), tsoff(&t[j - 1])) > kv {
-                    t[j] = t[j - 1];
+                while j > 0 && (key(&b[j - 1]), tsoff(&b[j - 1])) > kv {
+                    b[j] = b[j - 1];
                     j -= 1;
                 }
-                t[j] = v;
+                b[j] = v;
             }
             continue;
         }
-        if !sort_bucket(b, &key, &tsoff, tb, keys, pks, out) {
-            let o = out.len();
-            out.extend_from_slice(b);
-            out[o..].sort_unstable_by(cmp);
+        out.clear();
+        if sort_bucket(b, &key, &tsoff, tb, bsh, keys, pks, out) {
+            b.copy_from_slice(out);
+        } else {
+            b.sort_unstable_by(cmp);
         }
     }
 }
 
 /// Per-thread buffers for `bucket_sort`, reused across partitions to avoid fresh page faults.
+/// `scat` holds the sorted partition; `out` is one bucket's gather buffer.
 struct Scratch<T> {
     scat: Vec<T>,
     out: Vec<T>,
@@ -1125,6 +1176,9 @@ impl<T> Scratch<T> {
 /// Buckets up to this size are insertion-sorted in place instead of via packed keys.
 const SMALL: usize = 8;
 
+/// How many events ahead phase C prefetches user names.
+const NAME_PF: usize = 24;
+
 /// Appends `b` sorted by (key, tsoff, input index) to `out`; false (nothing appended) if the
 /// packed keys would not fit in 64 bits.
 #[inline(always)]
@@ -1133,6 +1187,7 @@ fn sort_bucket<T: Copy>(
     key: &impl Fn(&T) -> u64,
     tsoff: &impl Fn(&T) -> u64,
     tb: u32,
+    bsh: u32,
     keys: &mut Vec<u64>,
     pks: &mut Vec<u64>,
     out: &mut Vec<T>,
@@ -1152,6 +1207,31 @@ fn sort_bucket<T: Copy>(
         if rb == 0 {
             return false;
         }
+        let sh = tb + ib;
+        let mask = (1u64 << ib) - 1;
+        // Bucket members share every key bit above `bsh`, so the key bits just below it order
+        // the persons as the full key does, as long as no two persons share them. Use those
+        // bits as the rank and check the sorted runs; on a clash, rank by sort + dedup below.
+        let rbits = rb.min(bsh);
+        if rbits >= 8 {
+            let lsh = bsh - rbits;
+            let rmask = (1u64 << rbits) - 1;
+            keys.extend(
+                b.iter().enumerate().map(|(i, v)| (((key(v) >> lsh) & rmask) << sh) | (tsoff(v) << ib) | i as u64),
+            );
+            keys.sort_unstable();
+            let mut ok = true;
+            for w in keys.windows(2) {
+                let same_rank = (w[0] >> sh) == (w[1] >> sh);
+                let (x, y) = unsafe { (b.get_unchecked((w[0] & mask) as usize), b.get_unchecked((w[1] & mask) as usize)) };
+                ok &= !same_rank | (key(x) == key(y));
+            }
+            if ok {
+                out.extend(keys.iter().map(|&k| unsafe { *b.get_unchecked((k & mask) as usize) }));
+                return true;
+            }
+            keys.clear();
+        }
         pks.clear();
         pks.extend(b.iter().map(key));
         pks.sort_unstable();
@@ -1159,7 +1239,6 @@ fn sort_bucket<T: Copy>(
         if rb < 64 && pks.len() as u64 > (1u64 << rb) {
             return false;
         }
-        let sh = tb + ib;
         keys.extend(b.iter().enumerate().map(|(i, v)| {
             let r = match pks.binary_search(&key(v)) {
                 Ok(r) => r as u64,
