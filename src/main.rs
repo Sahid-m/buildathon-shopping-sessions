@@ -5,6 +5,7 @@ mod keys;
 #[cfg(test)]
 mod parse_fuzz;
 mod pq;
+mod slab;
 mod ts;
 mod wc;
 
@@ -16,6 +17,7 @@ use std::time::Instant;
 
 use keys::{Key, KeyMap, hash64, key128, mum};
 use memmap2::Mmap;
+use slab::{List, Pool};
 
 pub const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
@@ -283,7 +285,9 @@ fn ensure_tunables() {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
-        if std::env::var("GLIBC_TUNABLES").map(|v| v.contains("hugetlb")).unwrap_or(false) {
+        if std::env::var_os("SS_NOTUNE").is_some()
+            || std::env::var("GLIBC_TUNABLES").map(|v| v.contains("hugetlb")).unwrap_or(false)
+        {
             return;
         }
         if let Ok(exe) = std::env::current_exe() {
@@ -404,9 +408,13 @@ fn main() {
     let (psha, pshc) = (64 - npa_bits, 64 - npc_bits);
     let est_ev_per_part = (total_ev_bytes / 85 / nt.max(1) / npa).max(64);
     let est_evc_per_part = (total_ev_bytes / 85 / nt.max(1) / npc).max(64);
-    let ev_a: Vec<Mutex<Vec<Vec<EvA>>>> = (0..nt)
-        .map(|_| Mutex::new((0..npa).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
-        .collect();
+    let _ = (est_ev_per_part, est_evc_per_part);
+    // Partition records live in pool chunks; events B output reuses events A chunks.
+    let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
+    let pool = Pool::new(total_ev_bytes / 2 + total_cl_bytes / 2 + 3 * nt * (npa + npc) * slab::CHUNK + (64 << 20));
+    let pool = &pool;
+    let ev_a: Vec<Mutex<Vec<List<EvA>>>> =
+        (0..nt).map(|_| Mutex::new((0..npa).map(|_| List::default()).collect())).collect();
 
     let total_edges: usize = ln_out.iter().map(|m| m.lock().unwrap().len()).sum();
     let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(1024);
@@ -506,9 +514,10 @@ fn main() {
                     psha,
                     &mut g,
                     &mut st,
+                    pool,
                 );
             }
-            st.finish(&mut g);
+            st.finish(&mut g, pool);
         });
 
         for t in 1..nt {
@@ -531,9 +540,10 @@ fn main() {
                         psha,
                         &mut g,
                         &mut st,
+                        pool,
                     );
                 }
-                st.finish(&mut g);
+                st.finish(&mut g, pool);
             });
         }
     });
@@ -565,11 +575,8 @@ fn main() {
 
     // ---- clicks ----
     let cl_chunks = chunks(&cl_maps, CH);
-    let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
-    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / npc).max(32);
-    let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..npc).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
-        .collect();
+    let cl_c: Vec<Mutex<Vec<List<ClC>>>> =
+        (0..nt).map(|_| Mutex::new((0..npc).map(|_| List::default()).collect())).collect();
     let cl_tmp: Vec<Mutex<Vec<ClB>>> = (0..nt).map(|_| Mutex::new(Vec::new())).collect();
     par_for(nt, cl_chunks.len(), |t, ci| {
         let (fi, s, e) = cl_chunks[ci];
@@ -595,7 +602,7 @@ fn main() {
             }
             let r = &tmp[i];
             let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> pshc) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
+            g[(pkey >> pshc) as usize].push(pool, ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
         }
     });
     drop(cl_tmp);
@@ -603,9 +610,8 @@ fn main() {
 
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
     let ev_a = split_parts(ev_a);
-    let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..npc).map(|_| Vec::with_capacity(est_evc_per_part)).collect()))
-        .collect();
+    let ev_c: Vec<Mutex<Vec<List<EvC>>>> =
+        (0..nt).map(|_| Mutex::new((0..npc).map(|_| List::default()).collect())).collect();
     let next_p = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let ev_a_ref = &ev_a;
@@ -641,7 +647,7 @@ fn main() {
                     }
 
                     for tv in &parts {
-                        for r in tv {
+                        tv.for_slices(|sl| for r in sl {
                             let h = r.ehash;
                             let tag = (h as u32) | 1;
                             let mut i = (h >> 16) as usize & mask;
@@ -665,7 +671,10 @@ fn main() {
                                 }
                                 i = (i + 1) & mask;
                             }
-                        }
+                        });
+                    }
+                    for tv in parts {
+                        tv.release(pool);
                     }
 
                     for i in 0..best.len() {
@@ -679,10 +688,10 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        st.push(&mut g, (pkey >> pshc) as usize, EvC::new(pkey, name, dt, price, r.cat()));
+                        st.push(&mut g, pool, (pkey >> pshc) as usize, EvC::new(pkey, name, dt, price, r.cat()));
                     }
                 }
-                st.finish(&mut g);
+                st.finish(&mut g, pool);
             });
         }
     });
@@ -715,14 +724,14 @@ fn main() {
         let (esc, csc) = &mut *scr;
         bucket_sort(&ev_c, p, bsh, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
-        }, esc);
+        }, esc, pool);
         let evs = &esc.out;
         bucket_sort(&cl_c, p, bsh, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.dt().cmp(&b.dt()))
                 .then_with(|| a.cid.get().cmp(b.cid.get()))
-        }, csc);
+        }, csc, pool);
         let cls = &mut csc.out;
         // The packed sort keeps equal (pkey, ts) clicks in input order; order those runs by
         // click_id so the dedup below sees copies side by side.
@@ -905,7 +914,7 @@ fn main() {
 
 /// Partition indices, largest first (sizes summed over threads), so whale partitions start
 /// early and do not leave one thread running alone at the end.
-fn lpt_order<T, U>(a: &Parts<T>, b: &Parts<U>, np: usize) -> Vec<usize> {
+fn lpt_order<T: Copy, U: Copy>(a: &Parts<T>, b: &Parts<U>, np: usize) -> Vec<usize> {
     let size = |p: usize| -> usize {
         a.iter().map(|w| w[p].lock().unwrap().len()).sum::<usize>()
             + b.iter().map(|w| w[p].lock().unwrap().len()).sum::<usize>()
@@ -916,14 +925,14 @@ fn lpt_order<T, U>(a: &Parts<T>, b: &Parts<U>, np: usize) -> Vec<usize> {
 }
 
 /// Per-thread, per-partition buffers; each partition is taken (and freed) by its one consumer.
-type Parts<T> = Vec<Vec<Mutex<Vec<T>>>>;
+type Parts<T> = Vec<Vec<Mutex<List<T>>>>;
 
-fn split_parts<T>(v: Vec<Mutex<Vec<Vec<T>>>>) -> Parts<T> {
+fn split_parts<T>(v: Vec<Mutex<Vec<List<T>>>>) -> Parts<T> {
     v.into_iter().map(|m| m.into_inner().unwrap().into_iter().map(Mutex::new).collect()).collect()
 }
 
-/// Takes partition `p` out of every thread's buffers, so it is freed once consumed.
-fn take_part<T>(parts: &Parts<T>, p: usize) -> Vec<Vec<T>> {
+/// Takes partition `p` out of every thread's buffers; the consumer releases it to the pool.
+fn take_part<T: Copy>(parts: &Parts<T>, p: usize) -> Vec<List<T>> {
     parts.iter().map(|w| std::mem::take(&mut *w[p].lock().unwrap())).collect()
 }
 
@@ -942,14 +951,17 @@ fn bucket_sort<T: Copy>(
     tb: u32,
     cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Copy,
     sc: &mut Scratch<T>,
+    pool: &Pool,
 ) {
     let bucket = |v: &T| ((key(v) >> bsh) & 4095) as usize;
     let workers = take_part(parts, p);
     let mut ends = vec![0usize; 4096];
     for w in &workers {
-        for v in w {
-            ends[bucket(v)] += 1;
-        }
+        w.for_slices(|sl| {
+            for v in sl {
+                ends[bucket(v)] += 1;
+            }
+        });
     }
     let mut n = 0;
     for e in ends.iter_mut() {
@@ -962,15 +974,19 @@ fn bucket_sort<T: Copy>(
     scat.reserve(n);
     let dst = scat.as_mut_ptr();
     for w in &workers {
-        for v in w {
-            let o = &mut ends[bucket(v)];
-            // Prefix sums give each bucket a disjoint range with one slot per input.
-            unsafe { dst.add(*o).write(*v) };
-            *o += 1;
-        }
+        w.for_slices(|sl| {
+            for v in sl {
+                let o = &mut ends[bucket(v)];
+                // Prefix sums give each bucket a disjoint range with one slot per input.
+                unsafe { dst.add(*o).write(*v) };
+                *o += 1;
+            }
+        });
     }
     unsafe { scat.set_len(n) };
-    drop(workers);
+    for w in workers {
+        w.release(pool);
+    }
     out.clear();
     out.reserve(n);
     let mut start = 0;
@@ -1079,8 +1095,9 @@ fn process_ev_chunk(
     we: i64,
     unknown_cat: u16,
     psh: u32,
-    g: &mut [Vec<EvA>],
+    g: &mut [List<EvA>],
     st: &mut wc::Stager<EvA, 8>,
+    pool: &Pool,
 ) {
     let (fi, s, e) = ev_chunks[ci];
     let d: &[u8] = &ev_maps[fi][s..e];
@@ -1127,7 +1144,7 @@ fn process_ev_chunk(
         }
         let p = (ehash >> psh) as usize;
         let uh = hash64(key128(f[1]));
-        st.push(g, p, EvA {
+        st.push(g, pool, p, EvA {
             ehash,
             uh,
             ingest_cat: ing_u | ((cat as u64) << 52),

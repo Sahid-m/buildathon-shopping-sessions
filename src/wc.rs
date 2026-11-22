@@ -4,6 +4,8 @@
 
 use std::mem::MaybeUninit;
 
+use crate::slab::{List, Pool};
+
 pub struct Stager<T: Copy, const K: usize> {
     buf: Vec<[MaybeUninit<T>; K]>,
     cnt: Vec<u32>,
@@ -15,33 +17,25 @@ impl<T: Copy, const K: usize> Stager<T, K> {
     }
 
     #[inline(always)]
-    pub fn push(&mut self, out: &mut [Vec<T>], p: usize, v: T) {
+    pub fn push(&mut self, out: &mut [List<T>], pool: &Pool, p: usize, v: T) {
         let c = unsafe { self.cnt.get_unchecked_mut(p) };
         let b = unsafe { self.buf.get_unchecked_mut(p) };
         unsafe { b.get_unchecked_mut(*c as usize).write(v) };
         *c += 1;
         if *c as usize == K {
             *c = 0;
-            let dst = unsafe { out.get_unchecked_mut(p) };
-            dst.reserve(K);
-            unsafe {
-                stream_copy(
-                    dst.as_mut_ptr().add(dst.len()) as *mut u8,
-                    b.as_ptr() as *const u8,
-                    K * std::mem::size_of::<T>(),
-                );
-                dst.set_len(dst.len() + K);
-            }
+            let dst = unsafe { out.get_unchecked_mut(p) }.reserve(pool, K);
+            unsafe { stream_copy(dst as *mut u8, b.as_ptr() as *const u8, K * std::mem::size_of::<T>()) };
         }
     }
 
     /// Flushes the partial buffers and orders the streamed stores before later reads.
-    pub fn finish(&mut self, out: &mut [Vec<T>]) {
+    pub fn finish(&mut self, out: &mut [List<T>], pool: &Pool) {
         for p in 0..self.cnt.len() {
             let c = self.cnt[p] as usize;
             let b = &self.buf[p];
             for i in 0..c {
-                out[p].push(unsafe { b[i].assume_init() });
+                out[p].push(pool, unsafe { b[i].assume_init() });
             }
             self.cnt[p] = 0;
         }
@@ -51,6 +45,20 @@ impl<T: Copy, const K: usize> Stager<T, K> {
 
 #[inline(always)]
 unsafe fn stream_copy(dst: *mut u8, src: *const u8, n: usize) {
+    // Pool chunks are 64-byte aligned and flushes are K records, so with K * size a multiple
+    // of 32 every flush is whole 32-byte stores into whole cache lines.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    unsafe {
+        use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_stream_si256};
+        if n % 32 == 0 && (dst as usize) % 32 == 0 {
+            let mut i = 0;
+            while i < n {
+                _mm256_stream_si256(dst.add(i) as *mut __m256i, _mm256_loadu_si256(src.add(i) as *const __m256i));
+                i += 32;
+            }
+            return;
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use core::arch::x86_64::_mm_stream_si64;
