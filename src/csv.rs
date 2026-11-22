@@ -277,7 +277,7 @@ impl<'a> Scan<'a> {
 /// exactly N comma-separated fields and every quote wraps a whole field (`"x"`, `""`).
 /// Every comma separates fields, quoted or not. Empty lines are dropped (N >= 2).
 #[inline(always)]
-pub fn for_rows<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f: F) {
+pub fn for_rows_scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f: F) {
     let len = d.len();
     if len == 0 {
         return;
@@ -329,6 +329,135 @@ pub fn for_rows<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f
             }
         }
         start = p + 1;
+    }
+}
+
+/// Masks of `,`, `\n` and `"` for the 64 bytes at `p`. Bit i is byte i.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn masks3(p: *const u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let lo = _mm256_loadu_si256(p as *const __m256i);
+        let hi = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        #[inline(always)]
+        unsafe fn m(lo: __m256i, hi: __m256i, c: u8) -> u64 {
+            unsafe {
+                let v = _mm256_set1_epi8(c as i8);
+                (_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v)) as u32 as u64)
+                    | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v)) as u32 as u64) << 32)
+            }
+        }
+        (m(lo, hi, b','), m(lo, hi, b'\n'), m(lo, hi, b'"'))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn masks3(p: *const u8) -> (u64, u64, u64) {
+    use core::arch::aarch64::*;
+    unsafe {
+        #[inline(always)]
+        unsafe fn bits(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t, d: uint8x16_t) -> u64 {
+            unsafe {
+                const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+                let w = vld1q_u8(W.as_ptr());
+                let s0 = vpaddq_u8(vandq_u8(a, w), vandq_u8(b, w));
+                let s1 = vpaddq_u8(vandq_u8(c, w), vandq_u8(d, w));
+                let s = vpaddq_u8(s0, s1);
+                let s = vpaddq_u8(s, s);
+                vgetq_lane_u64(vreinterpretq_u64_u8(s), 0)
+            }
+        }
+        let a = vld1q_u8(p);
+        let b = vld1q_u8(p.add(16));
+        let c = vld1q_u8(p.add(32));
+        let d = vld1q_u8(p.add(48));
+        let m = |ch: u8| {
+            let v = vdupq_n_u8(ch);
+            bits(vceqq_u8(a, v), vceqq_u8(b, v), vceqq_u8(c, v), vceqq_u8(d, v))
+        };
+        (m(b','), m(b'\n'), m(b'"'))
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
+#[inline(always)]
+unsafe fn masks3(p: *const u8) -> (u64, u64, u64) {
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+    for i in 0..64 {
+        let x = unsafe { *p.add(i) };
+        c |= ((x == b',') as u64) << i;
+        n |= ((x == b'\n') as u64) << i;
+        q |= ((x == b'"') as u64) << i;
+    }
+    (c, n, q)
+}
+
+/// Calls `f` with the N fields (quotes stripped) of every well-formed line of `d`, a chunk
+/// of whole lines (a final line without `\n` counts). A line is well-formed when it has
+/// exactly N comma-separated fields and every quote wraps a whole field (`"x"`, `""`).
+/// Every comma separates fields, quoted or not. Empty lines are dropped (N >= 2).
+///
+/// Line at a time: while 128 bytes remain, the comma, newline and quote masks of the 128
+/// bytes at the line start give the line end (first newline), the comma count and the quote
+/// count with no branch per field. Lines of 128+ bytes and the last 128 bytes of the chunk
+/// go through `for_rows_scan`.
+#[inline(always)]
+pub fn for_rows<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f: F) {
+    let len = d.len();
+    let ptr = d.as_ptr();
+    let mut start = 0usize;
+    while start + 128 <= len {
+        let (c0, n0, q0, c1, n1, q1) = unsafe {
+            let p = ptr.add(start);
+            let (c0, n0, q0) = masks3(p);
+            let (c1, n1, q1) = masks3(p.add(64));
+            (c0, n0, q0, c1, n1, q1)
+        };
+        let nl = (n0 as u128) | ((n1 as u128) << 64);
+        if nl == 0 {
+            // A line of 128+ bytes.
+            let end = match memchr_nl(&d[start + 128..]) {
+                Some(x) => start + 128 + x + 1,
+                None => len,
+            };
+            for_rows_scan::<N, _>(&d[start..end], &mut f);
+            start = end;
+            continue;
+        }
+        let e = nl.trailing_zeros() as usize; // line end, relative to start
+        let below = (1u128 << e) - 1;
+        let mut cm = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+        let nq = (((q0 as u128) | ((q1 as u128) << 64)) & below).count_ones() as usize;
+        if cm.count_ones() as usize == N - 1 {
+            let mut fields: [&'a [u8]; N] = [&[]; N];
+            let mut s = start;
+            let mut stripped = 0usize;
+            for i in 0..N {
+                let fe = if i + 1 < N {
+                    let c = cm.trailing_zeros() as usize;
+                    cm &= cm.wrapping_sub(1);
+                    start + c
+                } else {
+                    start + e
+                };
+                let n = fe - s;
+                let first = unsafe { *ptr.add(s) };
+                let last = unsafe { *ptr.add(fe.max(1) - 1) };
+                let q = ((n >= 2) & (first == b'"') & (last == b'"')) as usize;
+                fields[i] = unsafe { std::slice::from_raw_parts(ptr.add(s + q), n - 2 * q) };
+                stripped += q;
+                s = fe + 1;
+            }
+            if nq == 2 * stripped {
+                f(&fields);
+            }
+        }
+        start += e + 1;
+    }
+    if start < len {
+        for_rows_scan::<N, _>(&d[start..], &mut f);
     }
 }
 

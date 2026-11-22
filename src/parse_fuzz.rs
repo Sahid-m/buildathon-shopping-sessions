@@ -51,11 +51,11 @@ fn gen_field(r: &mut Rng, out: &mut Vec<u8>) {
     }
 }
 
-pub fn check_csv<const N: usize>(r: &mut Rng, iters: usize) -> (usize, usize, usize) {
+pub fn check_csv<const N: usize>(r: &mut Rng, iters: usize, maxl: u64) -> (usize, usize, usize) {
     let (mut rows, mut div, mut lines) = (0, 0, 0);
     for _ in 0..iters {
         let mut d = vec![];
-        let nl = r.below(12);
+        let nl = r.below(maxl);
         for _ in 0..nl {
             let nf = if r.below(4) == 0 { r.below(N as u64 + 3) } else { N as u64 };
             for j in 0..nf { if j > 0 { d.push(b','); } gen_field(r, &mut d); }
@@ -144,9 +144,14 @@ fn fuzz_masks() {
 #[test]
 fn fuzz_csv() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
-    check_csv::<7>(&mut r, 100_000);
-    check_csv::<4>(&mut r, 100_000);
-    check_csv::<2>(&mut r, 100_000);
+    check_csv::<7>(&mut r, 100_000, 12);
+    check_csv::<4>(&mut r, 100_000, 12);
+    check_csv::<2>(&mut r, 100_000, 12);
+    // Long chunks exercise the 128-byte line path of `for_rows` and its hand-off to the
+    // block scanner (lines of 128+ bytes, the chunk tail).
+    check_csv::<7>(&mut r, 30_000, 80);
+    check_csv::<4>(&mut r, 30_000, 80);
+    check_csv::<2>(&mut r, 30_000, 80);
 }
 
 #[test]
