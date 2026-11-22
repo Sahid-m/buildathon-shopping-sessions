@@ -543,6 +543,7 @@ fn main() {
                 let mut tab: Vec<u64> = Vec::new();
                 let mut best: Vec<EvA> = Vec::new();
                 let mut g = ev_c_ref[t].lock().unwrap();
+                let mut st = wc::Stager::<EvC, 8>::new(NP);
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
                     if p >= NP {
@@ -603,7 +604,7 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        g[(pkey >> 56) as usize].push(EvC {
+                        st.push(&mut g, (pkey >> 56) as usize, EvC {
                             pkey,
                             ts: ws + dt as i64,
                             name,
@@ -613,6 +614,7 @@ fn main() {
                         });
                     }
                 }
+                st.finish(&mut g);
             });
         }
     });
