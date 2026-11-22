@@ -217,7 +217,7 @@ fn idhash_copy(b: &[u8]) -> (u64, u64) {
     (u64::from_le_bytes(buf[..8].try_into().unwrap()), u64::from_le_bytes(buf[8..].try_into().unwrap()))
 }
 
-#[inline(never)]
+#[inline(always)]
 fn idhash_long(b: &[u8]) -> u64 {
     let n = b.len();
     let mut h = P0 ^ (n as u64);
