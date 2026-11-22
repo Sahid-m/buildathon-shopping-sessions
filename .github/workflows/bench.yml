@@ -2,6 +2,8 @@
 # submission. Generates a 20M-event dataset with the official generator into tmpfs, as on the
 # scorer, and times the given commits.
 name: bench
+env:
+  VARIANTS: "c97bfa7:x86-64-v3 c97bfa7:x86-64-v4 c97bfa7:cascadelake"
 on:
   push:
     branches: [bench]
@@ -30,11 +32,13 @@ jobs:
           du -sh /dev/shm/s20
       - name: build commits
         run: |
-          SHAS="${{ github.event.inputs.shas }}"; SHAS="${SHAS:-1e589b6 c97bfa7}"
+          SHAS="${VARIANTS}"
           echo "SHAS=$SHAS" >> $GITHUB_ENV
-          for s in $SHAS; do
-            git worktree add -q /tmp/b-$s $s
-            (cd /tmp/b-$s && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
+          for v in $SHAS; do
+            sha=${v%%:*}; cpu=${v#*:}
+            [ -d /tmp/src-$sha ] || git worktree add -q /tmp/src-$sha $sha
+            rm -rf /tmp/b-$v; cp -r /tmp/src-$sha /tmp/b-$v
+            (cd /tmp/b-$v && RUSTFLAGS="-C target-cpu=$cpu" cargo build --release -q)
           done
       - name: time
         run: |
@@ -44,11 +48,9 @@ jobs:
             env "$@" NCPU=4 /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB  minflt %R" $bin /dev/shm/s20 /tmp/out 2>/tmp/err
             echo "== $label: $(grep WALL /tmp/err)"; grep -E 'ms\]' /tmp/err | tr '\n' ' ' | sed 's/  */ /g'; echo
           }
-          for i in 1 2 3; do
+          for i in 1 2 3 4; do
             for s in $SHAS; do
               run "$s default" /tmp/b-$s/target/release/sessions
-              run "$s hugetlb=1" /tmp/b-$s/target/release/sessions GLIBC_TUNABLES=glibc.malloc.hugetlb=1
-              run "$s hugetlb=0" /tmp/b-$s/target/release/sessions GLIBC_TUNABLES=glibc.malloc.hugetlb=0
             done
           done
       - name: check outputs agree
