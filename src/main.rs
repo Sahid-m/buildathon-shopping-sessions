@@ -73,16 +73,6 @@ impl EvA {
     }
 }
 
-/// A deduped, valid event before person resolution, bucketed by user hash.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct EvB {
-    uh: u64,
-    user: Str,
-    dtp: u64, // low 40b = ts - ws, high 24b = price
-    cat: u16,
-}
-
 /// A valid click before person resolution, bucketed by user hash.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -474,18 +464,25 @@ fn main() {
             i = (i + 1) & pmask;
         }
     };
+    // Lookups come in random order over a table bigger than cache, so callers prefetch the
+    // home slot PF lookups ahead.
+    const PF: usize = 16;
+    let prefetch_person =
+        |h: u64| csv::prefetch(unsafe { pmap.as_ptr().add(((h | 1) >> pshift) as usize) } as *const u8);
 
     // ---- clicks ----
     let cl_chunks = chunks(&cl_maps, CH);
     let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
     let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
-    let cl_b: Vec<Mutex<Vec<Vec<ClB>>>> = (0..nt)
+    let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
         .collect();
+    let cl_tmp: Vec<Mutex<Vec<ClB>>> = (0..nt).map(|_| Mutex::new(Vec::new())).collect();
     par_for(nt, cl_chunks.len(), |t, ci| {
         let (fi, s, e) = cl_chunks[ci];
         let d: &[u8] = &cl_maps[fi][s..e];
-        let mut g = cl_b[t].lock().unwrap();
+        let mut tmp = cl_tmp[t].lock().unwrap();
+        tmp.clear();
         csv::for_rows::<4, _>(d, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
@@ -496,26 +493,38 @@ fn main() {
             }
             let Some(camp) = campaigns.get(key128(f[2])) else { return };
             let uh = hash64(key128(f[1]));
-            g[(uh >> 56) as usize].push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
+            tmp.push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
         });
+        let mut g = cl_c[t].lock().unwrap();
+        for i in 0..tmp.len() {
+            if i + PF < tmp.len() {
+                prefetch_person(tmp[i + PF].uh);
+            }
+            let r = &tmp[i];
+            let (pkey, _) = person_of(r.uh, Str(0));
+            g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
+        }
     });
+    drop(cl_tmp);
     log(&t0, "clicks");
 
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
     let ev_a = split_parts(ev_a);
-    let ev_b: Vec<Mutex<Vec<Vec<EvB>>>> = (0..nt)
+    let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
     let next_p = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let ev_a_ref = &ev_a;
-        let ev_b_ref = &ev_b;
+        let ev_c_ref = &ev_c;
         let next_p_ref = &next_p;
+        let person_of = &person_of;
+        let prefetch_person = &prefetch_person;
         for t in 0..nt {
             s.spawn(move || {
                 let mut tab: Vec<u64> = Vec::new();
                 let mut best: Vec<EvA> = Vec::new();
-                let mut g = ev_b_ref[t].lock().unwrap();
+                let mut g = ev_c_ref[t].lock().unwrap();
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
                     if p >= NP {
@@ -565,16 +574,24 @@ fn main() {
                         }
                     }
 
-                    for r in &best {
+                    for i in 0..best.len() {
+                        if i + PF < best.len() {
+                            prefetch_person(best[i + PF].uh);
+                        }
+                        let r = &best[i];
                         let dt = r.dt();
                         if dt == INVALID_DT {
                             continue;
                         }
-                        g[(r.uh >> 56) as usize].push(EvB {
-                            uh: r.uh,
-                            user: r.user,
-                            dtp: dt | ((r.price() as u64) << 40),
+                        let (pkey, name) = person_of(r.uh, r.user);
+                        let price = r.price();
+                        g[(pkey >> 56) as usize].push(EvC {
+                            pkey,
+                            ts: ws + dt as i64,
+                            name,
+                            price,
                             cat: r.cat(),
+                            purchase: price > 0,
                         });
                     }
                 }
@@ -584,47 +601,7 @@ fn main() {
     drop(ev_a);
     log(&t0, "events B");
 
-    // ---- resolve persons: per user-hash bucket, probing only that bucket's pmap region ----
-    let ev_b = split_parts(ev_b);
-    let cl_b = split_parts(cl_b);
-    let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
-        .collect();
-    let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
-        .collect();
-    let order = lpt_order(&ev_b, &cl_b);
-    par_for(nt, NP, |t, qi| {
-        let q = order[qi];
-        {
-            let mut g = ev_c[t].lock().unwrap();
-            for tv in take_part(&ev_b, q) {
-                for r in &tv {
-                    let (pkey, name) = person_of(r.uh, r.user);
-                    let price = (r.dtp >> 40) as u32;
-                    g[(pkey >> 56) as usize].push(EvC {
-                        pkey,
-                        ts: ws + (r.dtp & 0xFF_FFFF_FFFF) as i64,
-                        name,
-                        price,
-                        cat: r.cat,
-                        purchase: price > 0,
-                    });
-                }
-            }
-        }
-        let mut g = cl_c[t].lock().unwrap();
-        for tv in take_part(&cl_b, q) {
-            for r in &tv {
-                let (pkey, _) = person_of(r.uh, Str(0));
-                g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
-            }
-        }
-    });
-    drop(ev_b);
-    drop(cl_b);
     drop(pmap);
-    log(&t0, "persons");
 
     // ---- phase C: sessions + attribution ----
     let ev_c = split_parts(ev_c);
