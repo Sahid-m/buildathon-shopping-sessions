@@ -251,9 +251,11 @@ fn small_lines(d: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// The scorer's kernel only gives huge pages to memory that asks for them (THP "madvise").
+/// glibc only madvises its arena heaps, so the mmap threshold is raised to its maximum to keep
+/// the ~300 KB partition buffers in those heaps (otherwise each gets its own 4 KB-page mapping).
 /// glibc's allocator asks when this tunable is set, which cuts page faults while the big
 /// buffers are first touched and page freeing at exit. Re-exec once with it set.
-const TUNABLES: &str = "glibc.malloc.hugetlb=1";
+const TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432";
 
 fn ensure_tunables() {
     #[cfg(target_os = "linux")]
