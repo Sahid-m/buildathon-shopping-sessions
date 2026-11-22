@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "c97bfa7:x86-64-v3 2921d31:x86-64-v3 2921d31:x86-64-v3:SS_POP=1"
+  VARIANTS: "2921d31:x86-64-v3 1b5477f:x86-64-v3"
 on:
   push:
     branches: [bench]
