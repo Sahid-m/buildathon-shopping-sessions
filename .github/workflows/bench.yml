@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "eae1cf8:x86-64-v3 6e8e87f:x86-64-v3 0b4a08e:x86-64-v3 db00575:x86-64-v3"
+  VARIANTS: "eae1cf8:x86-64-v3 db00575:x86-64-v3 f43d566:x86-64-v3"
 on:
   push:
     branches: [onepass-bench]
