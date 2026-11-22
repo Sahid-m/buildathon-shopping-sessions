@@ -741,9 +741,6 @@ fn main() {
                 let mut tab: Vec<u64> = Vec::new();
                 let mut g = ev_c_ref[t].lock().unwrap();
                 let mut st = wc::Stager::<EvC, 8>::new(npc);
-                // Survivors wait in a small ring while their pmap home slot is prefetched.
-                const RING: usize = 32;
-                let mut ring: [*const EvA; RING] = [std::ptr::null(); RING];
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
                     if p >= npa {
@@ -800,26 +797,21 @@ fn main() {
                         });
                     }
 
-                    let mut m = 0usize;
-                    let emit = |r: &EvA, g: &mut Vec<List<EvC>>, st: &mut wc::Stager<EvC, 8>| {
-                        let (pkey, name) = person_of(r.uh, r.user);
-                        st.push(g, pool, (pkey >> pshc) as usize, EvC::new(pkey, name, r.dt(), r.price(), r.cat()));
-                    };
+                    // Emit survivors in record order, prefetching each one's pmap home slot
+                    // PF records ahead within the chunk.
                     for tv in &parts {
-                        tv.for_slices(|sl| for r in sl {
-                            if r.dt() == INVALID_DT {
+                        tv.for_slices(|sl| for k in 0..sl.len() {
+                            if k + PF < sl.len() {
+                                prefetch_person(unsafe { sl.get_unchecked(k + PF) }.uh);
+                            }
+                            let r = unsafe { sl.get_unchecked(k) };
+                            let dt = r.dt();
+                            if dt == INVALID_DT {
                                 continue;
                             }
-                            prefetch_person(r.uh);
-                            if m >= PF {
-                                emit(unsafe { &*ring[(m - PF) % RING] }, &mut g, &mut st);
-                            }
-                            ring[m % RING] = r;
-                            m += 1;
+                            let (pkey, name) = person_of(r.uh, r.user);
+                            st.push(&mut g, pool, (pkey >> pshc) as usize, EvC::new(pkey, name, dt, r.price(), r.cat()));
                         });
-                    }
-                    for i in m.saturating_sub(PF)..m {
-                        emit(unsafe { &*ring[i % RING] }, &mut g, &mut st);
                     }
                     for tv in parts {
                         tv.release(pool);
