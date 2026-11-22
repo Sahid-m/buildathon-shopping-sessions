@@ -137,7 +137,18 @@ fn map_file(p: &Path) -> Option<Mmap> {
     if len == 0 {
         return None;
     }
-    unsafe { Mmap::map(&f).ok() }
+    if std::env::var_os("SS_POP").is_some() {
+        unsafe { memmap2::MmapOptions::new().populate().map(&f).ok() }
+    } else {
+        unsafe { Mmap::map(&f).ok() }
+    }
+}
+
+/// Maps files on `nt` threads, keeping order (with SS_POP each map pre-faults its pages).
+fn map_all(paths: &[PathBuf], nt: usize) -> Vec<Mmap> {
+    let slots: Vec<Mutex<Option<Mmap>>> = paths.iter().map(|_| Mutex::new(None)).collect();
+    par_for(nt, paths.len(), |_, i| *slots[i].lock().unwrap() = map_file(&paths[i]));
+    slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
 /// Splits every file's data region (after the header line) into chunks of whole lines.
@@ -295,9 +306,9 @@ fn main() {
     log(&t0, "small files");
 
     // map all big files
-    let ev_maps: Vec<Mmap> = list_csv(&data.join("events")).iter().filter_map(|p| map_file(p)).collect();
-    let cl_maps: Vec<Mmap> = list_csv(&data.join("clicks")).iter().filter_map(|p| map_file(p)).collect();
-    let ln_maps: Vec<Mmap> = list_csv(&data.join("links")).iter().filter_map(|p| map_file(p)).collect();
+    let ev_maps: Vec<Mmap> = map_all(&list_csv(&data.join("events")), nt);
+    let cl_maps: Vec<Mmap> = map_all(&list_csv(&data.join("clicks")), nt);
+    let ln_maps: Vec<Mmap> = map_all(&list_csv(&data.join("links")), nt);
     const CH: usize = 4 << 20;
     let ln_chunks = chunks(&ln_maps, CH);
 
