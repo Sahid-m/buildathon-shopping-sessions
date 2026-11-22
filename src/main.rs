@@ -784,16 +784,16 @@ fn main() {
 }
 
 /// Gathers partition `p` from every thread's output and sorts it. The partition already
-/// shares the top 8 key bits, so a counting pass on the next 8 bits leaves small buckets
-/// that sort in L1.
+/// shares the top 8 key bits, so a counting pass on the next 12 bits leaves buckets of
+/// about one person each, which sort with a few insertion-sort steps.
 fn bucket_sort<T: Copy>(
     workers: &[Vec<Vec<T>>],
     p: usize,
     key: impl Fn(&T) -> u64,
     cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Copy,
 ) -> Vec<T> {
-    let bucket = |v: &T| ((key(v) >> 48) & 255) as usize;
-    let mut ends = [0usize; 256];
+    let bucket = |v: &T| ((key(v) >> 44) & 4095) as usize;
+    let mut ends = vec![0usize; 4096];
     for w in workers {
         for v in &w[p] {
             ends[bucket(v)] += 1;
