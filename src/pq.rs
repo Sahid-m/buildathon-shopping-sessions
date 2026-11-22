@@ -3,10 +3,8 @@
 //! columns, REQUIRED or OPTIONAL.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::path::Path;
-
-use crate::UdRow;
 
 pub struct CdRow<'a> {
     pub campaign: &'a [u8],
@@ -88,68 +86,27 @@ impl T {
     }
 }
 
-pub enum Col<'a> {
-    Str(&'a str, Vec<&'a [u8]>, Option<Vec<bool>>),
-    I32Date(&'a str, Vec<i32>),
-    I64(&'a str, Vec<i64>),
+/// One column's data page body, already PLAIN-encoded, as slices written in order.
+struct ColOut<'a> {
+    name: &'a str,
+    ty: i32,      // physical type: 1 INT32, 2 INT64, 6 BYTE_ARRAY
+    logical: u8,  // 0 none, 1 UTF8 string, 6 DATE
+    opt: bool,
+    body: Vec<&'a [u8]>,
 }
 
-fn write(path: &Path, cols: Vec<Col>, nrows: usize) {
-    let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
-    out.extend_from_slice(b"PAR1");
-    // (type, optional, offset, size, name, logical)
-    let mut metas: Vec<(i32, bool, i64, i64, &str, u8)> = vec![];
-    for c in &cols {
-        let mut page: Vec<u8> = vec![];
-        let (ty, opt, name, logical) = match c {
-            Col::Str(name, vals, def) => {
-                if let Some(def) = def {
-                    // RLE/bit-packed hybrid, bit width 1, all as bit-packed groups of 8
-                    let groups = nrows.div_ceil(8);
-                    let mut lv: Vec<u8> = vec![];
-                    let mut h = ((groups as u64) << 1) | 1;
-                    while h >= 0x80 {
-                        lv.push((h as u8) | 0x80);
-                        h >>= 7;
-                    }
-                    lv.push(h as u8);
-                    let mut bits = vec![0u8; groups];
-                    for (i, &d) in def.iter().enumerate() {
-                        if d {
-                            bits[i >> 3] |= 1 << (i & 7);
-                        }
-                    }
-                    lv.extend_from_slice(&bits);
-                    page.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-                    page.extend_from_slice(&lv);
-                }
-                let total: usize = vals.iter().map(|v| v.len() + 4).sum();
-                page.reserve(total);
-                for v in vals {
-                    page.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    page.extend_from_slice(v);
-                }
-                (6, def.is_some(), *name, 1u8)
-            }
-            Col::I32Date(name, vals) => {
-                page.reserve(vals.len() * 4);
-                for v in vals {
-                    page.extend_from_slice(&v.to_le_bytes());
-                }
-                (1, false, *name, 6u8)
-            }
-            Col::I64(name, vals) => {
-                page.reserve(vals.len() * 8);
-                for v in vals {
-                    page.extend_from_slice(&v.to_le_bytes());
-                }
-                (2, false, *name, 0u8)
-            }
-        };
+/// Writes one row group with one page per column. Column bodies are passed through to the
+/// file with a vectored write, without being copied into a staging buffer.
+fn write(path: &Path, cols: &[ColOut], nrows: usize) {
+    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
+    let mut metas: Vec<(i64, i64)> = Vec::with_capacity(cols.len());
+    let mut off = 4i64; // after "PAR1"
+    for c in cols {
+        let plen: usize = c.body.iter().map(|b| b.len()).sum();
         let mut h = T::new();
         h.i32f(1, 0); // DATA_PAGE
-        h.i32f(2, page.len() as i32);
-        h.i32f(3, page.len() as i32);
+        h.i32f(2, plen as i32);
+        h.i32f(3, plen as i32);
         h.begin(5);
         h.i32f(1, nrows as i32);
         h.i32f(2, 0); // PLAIN
@@ -157,33 +114,32 @@ fn write(path: &Path, cols: Vec<Col>, nrows: usize) {
         h.i32f(4, 3); // RLE
         h.end();
         h.b.push(0);
-        let off = out.len() as i64;
-        out.extend_from_slice(&h.b);
-        out.extend_from_slice(&page);
-        let size = out.len() as i64 - off;
-        metas.push((ty, opt, off, size, name, logical));
+        let size = (h.b.len() + plen) as i64;
+        metas.push((off, size));
+        off += size;
+        heads.push(h.b);
     }
     // FileMetaData
     let mut m = T::new();
     m.i32f(1, 1);
-    m.list(2, STRUCT, metas.len() + 1);
+    m.list(2, STRUCT, cols.len() + 1);
     m.begin_elem();
     m.binf(4, b"schema");
-    m.i32f(5, metas.len() as i32);
+    m.i32f(5, cols.len() as i32);
     m.end();
-    for &(ty, opt, _, _, name, logical) in &metas {
+    for c in cols {
         m.begin_elem();
-        m.i32f(1, ty);
-        m.i32f(3, opt as i32);
-        m.binf(4, name.as_bytes());
-        match logical {
+        m.i32f(1, c.ty);
+        m.i32f(3, c.opt as i32);
+        m.binf(4, c.name.as_bytes());
+        match c.logical {
             1 => m.i32f(6, 0), // UTF8
             6 => m.i32f(6, 6), // DATE
             _ => {}
         }
-        if logical != 0 {
+        if c.logical != 0 {
             m.begin(10);
-            m.begin(logical as i16);
+            m.begin(c.logical as i16);
             m.end();
             m.end();
         }
@@ -192,20 +148,20 @@ fn write(path: &Path, cols: Vec<Col>, nrows: usize) {
     m.i64f(3, nrows as i64);
     m.list(4, STRUCT, 1);
     m.begin_elem();
-    m.list(1, STRUCT, metas.len());
+    m.list(1, STRUCT, cols.len());
     let mut total = 0i64;
-    for &(ty, _, off, size, name, _) in &metas {
+    for (c, &(off, size)) in cols.iter().zip(&metas) {
         total += size;
         m.begin_elem();
         m.i64f(2, off);
         m.begin(3);
-        m.i32f(1, ty);
+        m.i32f(1, c.ty);
         m.list(2, I32, 2);
         m.zz(0);
         m.zz(3);
         m.list(3, BIN, 1);
-        m.varint(name.len() as u64);
-        m.b.extend_from_slice(name.as_bytes());
+        m.varint(c.name.len() as u64);
+        m.b.extend_from_slice(c.name.as_bytes());
         m.i32f(4, 0);
         m.i64f(5, nrows as i64);
         m.i64f(6, size);
@@ -218,42 +174,133 @@ fn write(path: &Path, cols: Vec<Col>, nrows: usize) {
     m.i64f(3, nrows as i64);
     m.end();
     m.b.push(0);
-    out.extend_from_slice(&m.b);
-    out.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
+    let mlen = (m.b.len() as u32).to_le_bytes();
+    m.b.extend_from_slice(&mlen);
+    m.b.extend_from_slice(b"PAR1");
+
+    let mut iov: Vec<IoSlice> = vec![IoSlice::new(b"PAR1")];
+    for (c, h) in cols.iter().zip(&heads) {
+        iov.push(IoSlice::new(h));
+        for b in &c.body {
+            if !b.is_empty() {
+                iov.push(IoSlice::new(b));
+            }
+        }
+    }
+    iov.push(IoSlice::new(&m.b));
     let mut f = File::create(path).unwrap();
-    f.write_all(&out).unwrap();
+    let mut s = &mut iov[..];
+    while !s.is_empty() {
+        let n = f.write_vectored(s).unwrap();
+        assert!(n > 0, "short write");
+        IoSlice::advance_slices(&mut s, n);
+    }
 }
 
-pub fn write_user_daily(path: &Path, rows: &[UdRow], cats: &[&[u8]]) {
-    let top: Vec<&[u8]> = rows.iter().filter_map(|r| r.top.map(|c| cats[c as usize])).collect();
-    let def: Vec<bool> = rows.iter().map(|r| r.top.is_some()).collect();
-    write(
-        path,
-        vec![
-            Col::Str("user_id", rows.iter().map(|r| r.name.get()).collect(), None),
-            Col::I32Date("day", rows.iter().map(|r| r.day).collect()),
-            Col::I64("sessions", rows.iter().map(|r| r.sessions).collect()),
-            Col::I64("events", rows.iter().map(|r| r.events).collect()),
-            Col::I64("revenue_cents", rows.iter().map(|r| r.revenue).collect()),
-            Col::Str("top_category", top, Some(def)),
-        ],
-        rows.len(),
-    );
+/// user_daily columns, PLAIN-encoded as rows are produced, so the file write passes them
+/// through unchanged. `sessions` and `events` are INT32 (any integer width is accepted).
+#[derive(Default)]
+pub struct UdCols {
+    uid: Vec<u8>,
+    day: Vec<u8>,
+    ses: Vec<u8>,
+    evn: Vec<u8>,
+    rev: Vec<u8>,
+    top: Vec<u8>,
+    def: Vec<u8>,
+    acc: u8,
+    n: usize,
+}
+
+impl UdCols {
+    pub fn with_capacity(rows: usize) -> UdCols {
+        UdCols {
+            uid: Vec::with_capacity(rows * 16),
+            day: Vec::with_capacity(rows * 4),
+            ses: Vec::with_capacity(rows * 4),
+            evn: Vec::with_capacity(rows * 4),
+            rev: Vec::with_capacity(rows * 8),
+            top: Vec::with_capacity(rows * 12),
+            def: Vec::with_capacity(rows / 8 + 1),
+            acc: 0,
+            n: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, name: &[u8], day: i32, sessions: i64, events: i64, revenue: i64, top: Option<&[u8]>) {
+        self.uid.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        self.uid.extend_from_slice(name);
+        self.day.extend_from_slice(&day.to_le_bytes());
+        self.ses.extend_from_slice(&(sessions as i32).to_le_bytes());
+        self.evn.extend_from_slice(&(events as i32).to_le_bytes());
+        self.rev.extend_from_slice(&revenue.to_le_bytes());
+        if let Some(t) = top {
+            self.top.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            self.top.extend_from_slice(t);
+            self.acc |= 1 << (self.n & 7);
+        }
+        self.n += 1;
+        if self.n & 7 == 0 {
+            self.def.push(self.acc);
+            self.acc = 0;
+        }
+    }
+}
+
+pub fn write_user_daily(path: &Path, ud: &UdCols) {
+    let n = ud.n;
+    let mut def = ud.def.clone();
+    if n & 7 != 0 {
+        def.push(ud.acc);
+    }
+    // Definition levels: RLE/bit-packed hybrid, bit width 1, all as bit-packed groups of 8.
+    let groups = n.div_ceil(8);
+    let mut lh: Vec<u8> = vec![0; 4];
+    let mut h = ((groups as u64) << 1) | 1;
+    while h >= 0x80 {
+        lh.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    lh.push(h as u8);
+    let lvlen = (lh.len() - 4 + def.len()) as u32;
+    lh[..4].copy_from_slice(&lvlen.to_le_bytes());
+    let cols = [
+        ColOut { name: "user_id", ty: 6, logical: 1, opt: false, body: vec![&ud.uid] },
+        ColOut { name: "day", ty: 1, logical: 6, opt: false, body: vec![&ud.day] },
+        ColOut { name: "sessions", ty: 1, logical: 0, opt: false, body: vec![&ud.ses] },
+        ColOut { name: "events", ty: 1, logical: 0, opt: false, body: vec![&ud.evn] },
+        ColOut { name: "revenue_cents", ty: 2, logical: 0, opt: false, body: vec![&ud.rev] },
+        ColOut { name: "top_category", ty: 6, logical: 1, opt: true, body: vec![&lh, &def, &ud.top] },
+    ];
+    write(path, &cols, n);
 }
 
 pub fn write_campaign_daily(path: &Path, rows: &[CdRow]) {
-    write(
-        path,
-        vec![
-            Col::Str("campaign_id", rows.iter().map(|r| r.campaign).collect(), None),
-            Col::Str("channel", rows.iter().map(|r| r.channel).collect(), None),
-            Col::I32Date("day", rows.iter().map(|r| r.day).collect()),
-            Col::I64("sessions", rows.iter().map(|r| r.sessions).collect()),
-            Col::I64("purchasing_sessions", rows.iter().map(|r| r.purchasing).collect()),
-            Col::I64("revenue_cents", rows.iter().map(|r| r.revenue).collect()),
-            Col::I64("assisted_sessions", rows.iter().map(|r| r.assisted).collect()),
-        ],
-        rows.len(),
-    );
+    fn strs<'a>(it: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+        let mut v = vec![];
+        for s in it {
+            v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            v.extend_from_slice(s);
+        }
+        v
+    }
+    let i64s = |f: &dyn Fn(&CdRow) -> i64| -> Vec<u8> { rows.iter().flat_map(|r| f(r).to_le_bytes()).collect() };
+    let camp = strs(rows.iter().map(|r| r.campaign));
+    let chan = strs(rows.iter().map(|r| r.channel));
+    let day: Vec<u8> = rows.iter().flat_map(|r| r.day.to_le_bytes()).collect();
+    let ses = i64s(&|r| r.sessions);
+    let pur = i64s(&|r| r.purchasing);
+    let rev = i64s(&|r| r.revenue);
+    let ast = i64s(&|r| r.assisted);
+    let cols = [
+        ColOut { name: "campaign_id", ty: 6, logical: 1, opt: false, body: vec![&camp] },
+        ColOut { name: "channel", ty: 6, logical: 1, opt: false, body: vec![&chan] },
+        ColOut { name: "day", ty: 1, logical: 6, opt: false, body: vec![&day] },
+        ColOut { name: "sessions", ty: 2, logical: 0, opt: false, body: vec![&ses] },
+        ColOut { name: "purchasing_sessions", ty: 2, logical: 0, opt: false, body: vec![&pur] },
+        ColOut { name: "revenue_cents", ty: 2, logical: 0, opt: false, body: vec![&rev] },
+        ColOut { name: "assisted_sessions", ty: 2, logical: 0, opt: false, body: vec![&ast] },
+    ];
+    write(path, &cols, rows.len());
 }

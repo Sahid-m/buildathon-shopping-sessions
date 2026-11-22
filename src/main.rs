@@ -151,13 +151,20 @@ impl ClC {
     }
 }
 
-pub struct UdRow {
-    pub name: Str,
-    pub day: i32,
-    pub sessions: i64,
-    pub events: i64,
-    pub revenue: i64,
-    pub top: Option<u16>,
+struct UdRow {
+    name: Str,
+    day: i32,
+    sessions: i64,
+    events: i64,
+    revenue: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+struct CampCell {
+    rev: u64,
+    ses: u32,
+    pur: u32,
 }
 
 fn log(t0: &Instant, msg: &str) {
@@ -707,12 +714,25 @@ fn main() {
     // Bits for a timestamp offset from the click window start (covers events too).
     let tb = 64 - ((we - cws - 1).max(1) as u64).leading_zeros();
     struct TOut {
-        ud: Vec<UdRow>,
-        camp: Vec<[i64; 4]>,
+        ud: pq::UdCols,
+        // Per (campaign, day): revenue, sessions, purchasing sessions. 16 bytes per cell
+        // (instead of 32) keeps this randomly-hit table at half the L2 footprint.
+        camp: Vec<CampCell>,
+        assisted: Vec<u32>,
     }
+    // Rough upper estimate of rows per thread (one row per person-day, ~85 B per event line);
+    // the vectors still grow if it is short.
+    let est_rows = total_ev_bytes / 85 / nt.max(1) / 3 + 1024;
     let touts: Vec<Mutex<TOut>> = (0..nt)
-        .map(|_| Mutex::new(TOut { ud: Vec::with_capacity(65536), camp: vec![[0; 4]; (ncamp + 1) * ndays] }))
+        .map(|_| {
+            Mutex::new(TOut {
+                ud: pq::UdCols::with_capacity(est_rows),
+                camp: vec![CampCell::default(); (ncamp + 1) * ndays],
+                assisted: vec![0; (ncamp + 1) * ndays],
+            })
+        })
         .collect();
+    let cat_strs: &[&[u8]] = &cat_names;
     let scratch: Vec<Mutex<(Scratch<EvC>, Scratch<ClC>)>> =
         (0..nt).map(|_| Mutex::new((Scratch::new(), Scratch::new()))).collect();
     let order = lpt_order(&ev_c, &cl_c, npc);
@@ -749,7 +769,7 @@ fn main() {
         cls.dedup_by(|a, b| a.pkey == b.pkey && a.dt() == b.dt() && a.cid.get() == b.cid.get());
 
         let mut g = touts[t].lock().unwrap();
-        let TOut { ud, camp } = &mut *g;
+        let TOut { ud, camp, assisted } = &mut *g;
         let mut cnt = vec![0u32; ncamp];
         let mut pos = vec![0u32; ncamp];
         let mut active: Vec<u16> = vec![];
@@ -757,8 +777,20 @@ fn main() {
         let mut cat_touched: Vec<u16> = vec![];
         let mut ci = 0usize;
         let mut i = 0usize;
+        // User names are random reads into the input; prefetch each person's name once, about
+        // NAME_PF events ahead of where it is copied to the output.
+        let mut pf = 0usize;
         while i < evs.len() {
             let pk = evs[i].pkey;
+            let pf_end = (i + NAME_PF).min(evs.len());
+            while pf < pf_end {
+                if pf == 0 || evs[pf].pkey != evs[pf - 1].pkey {
+                    let nm = evs[pf].name.get();
+                    csv::prefetch(nm.as_ptr());
+                    csv::prefetch(nm.as_ptr().wrapping_add(nm.len().saturating_sub(1)));
+                }
+                pf += 1;
+            }
             let mut j = i;
             while j < evs.len() && evs[j].pkey == pk {
                 j += 1;
@@ -780,9 +812,9 @@ fn main() {
                 let day = start.div_euclid(DAY) as i32;
                 let di = (start.div_euclid(DAY) - day0) as usize;
                 if cur.as_ref().map(|c| c.day != day).unwrap_or(false) {
-                    let mut row = cur.take().unwrap();
-                    row.top = top_cat(&mut catsum, &mut cat_touched);
-                    ud.push(row);
+                    let row = cur.take().unwrap();
+                    let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
+                    ud.push(row.name.get(), row.day, row.sessions, row.events, row.revenue, top);
                 }
                 let mut last = start;
                 let mut m = k;
@@ -803,7 +835,7 @@ fn main() {
                     m += 1;
                 }
                 let nev = (m - k) as i64;
-                let row = cur.get_or_insert(UdRow { name, day, sessions: 0, events: 0, revenue: 0, top: None });
+                let row = cur.get_or_insert(UdRow { name, day, sessions: 0, events: 0, revenue: 0 });
                 row.sessions += 1;
                 row.events += nev;
                 row.revenue += rev;
@@ -840,21 +872,21 @@ fn main() {
                         }
                     }
                     for &c in &active {
-                        camp[c as usize * ndays + di][3] += 1;
+                        assisted[c as usize * ndays + di] += 1;
                     }
                     pc[b].camp() as usize
                 } else {
                     ncamp
                 };
                 let r = &mut camp[credited * ndays + di];
-                r[0] += 1;
-                r[1] += purchased as i64;
-                r[2] += rev;
+                r.rev += rev as u64;
+                r.ses += 1;
+                r.pur += purchased as u32;
                 k = m;
             }
-            if let Some(mut row) = cur.take() {
-                row.top = top_cat(&mut catsum, &mut cat_touched);
-                ud.push(row);
+            if let Some(row) = cur.take() {
+                let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
+                ud.push(row.name.get(), row.day, row.sessions, row.events, row.revenue, top);
             }
             for q in lo..hi {
                 cnt[pc[q].camp() as usize] = 0;
@@ -869,22 +901,21 @@ fn main() {
     let touts: Vec<TOut> = touts.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut camp_tot = vec![[0i64; 4]; (ncamp + 1) * ndays];
     for to in &touts {
-        for (a, b) in camp_tot.iter_mut().zip(to.camp.iter()) {
-            for x in 0..4 {
-                a[x] += b[x];
-            }
+        for ((a, b), &x) in camp_tot.iter_mut().zip(to.camp.iter()).zip(to.assisted.iter()) {
+            a[0] += b.ses as i64;
+            a[1] += b.pur as i64;
+            a[2] += b.rev as i64;
+            a[3] += x as i64;
         }
     }
     let ud_dir = out.join("user_daily");
     let cd_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
-    let cat_strs: Vec<&[u8]> = cat_names.clone();
     std::thread::scope(|s| {
         for (ti, to) in touts.iter().enumerate() {
             let path = ud_dir.join(format!("part-{ti}.parquet"));
-            let cat_strs = &cat_strs;
-            s.spawn(move || pq::write_user_daily(&path, &to.ud, cat_strs));
+            s.spawn(move || pq::write_user_daily(&path, &to.ud));
         }
         let mut rows: Vec<pq::CdRow> = vec![];
         for c in 0..=ncamp {
@@ -1035,6 +1066,9 @@ impl<T> Scratch<T> {
 
 /// Buckets up to this size are insertion-sorted in place instead of via packed keys.
 const SMALL: usize = 8;
+
+/// How many events ahead phase C prefetches user names.
+const NAME_PF: usize = 24;
 
 /// Appends `b` sorted by (key, tsoff, input index) to `out`; false (nothing appended) if the
 /// packed keys would not fit in 64 bits.
