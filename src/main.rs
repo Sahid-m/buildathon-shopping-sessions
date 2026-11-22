@@ -10,7 +10,7 @@ mod wc;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -358,9 +358,11 @@ fn main() {
         *ln_out[ci].lock().unwrap() = v;
     });
 
-    // ---- events A (one pass) + clicks, keyed by raw user; union-find on thread 0 first ----
-    // Each event row gives a payload (EvC keyed by user hash, in user partitions) and a dedup
-    // candidate (in event partitions) holding the payload's location.
+    // ---- events A (one pass) + clicks; union-find on thread 0 first ----
+    // Each event row gives a payload (EvC) and a dedup candidate (in event partitions) holding
+    // the payload's location. Once the person table is ready, payloads are keyed by person
+    // (resolved set); rows parsed before that are keyed by raw user (unresolved set) and
+    // resolved after dedup.
     let ev_chunks = chunks(&ev_maps, CH);
     let cl_chunks = chunks(&cl_maps, CH);
     let total_ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
@@ -369,38 +371,43 @@ fn main() {
     let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
     let total_edges: usize = ln_out.iter().map(|m| m.lock().unwrap().len()).sum();
     let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(1024);
-    let mut pmap: Vec<(u64, u64)> = Vec::new();
+    let pm_cell: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
 
-    let thb = (nt.next_power_of_two().trailing_zeros()) as u32;
-    let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
-        .collect();
-    let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
-        .collect();
+    // Payload locations name one of 2*nt worker lists: t (resolved) or nt + t (unresolved).
+    let thb = ((2 * nt).next_power_of_two().trailing_zeros()) as u32;
+    let mk = |n: usize, cap: usize| -> Vec<Mutex<Vec<Vec<EvC>>>> {
+        (0..n).map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(cap)).collect())).collect()
+    };
+    let mkc = |n: usize, cap: usize| -> Vec<Mutex<Vec<Vec<ClC>>>> {
+        (0..n).map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(cap)).collect())).collect()
+    };
+    let cl_c = mkc(nt, est_cl_per_part);
+    let cl_u = mkc(nt, est_cl_per_part / 2);
+    let ev_c = mk(nt, est_ev_per_part);
+    let ev_u = mk(nt, est_ev_per_part / 2);
     let ev_k: Vec<Mutex<Vec<Vec<Cand>>>> = (0..nt)
         .map(|_| Mutex::new((0..NPK).map(|_| Vec::with_capacity(est_ev_per_part * NP / NPK + 16)).collect()))
         .collect();
     let next_ev = AtomicUsize::new(0);
     let next_cl = AtomicUsize::new(0);
     std::thread::scope(|s| {
-        let mut pmap_ptr = Some(&mut pmap);
         for t in 0..nt {
-            let (cl_c, ev_c, ev_k, next_ev, next_cl, ev_chunks, cl_chunks, ev_maps, cl_maps, products, campaigns) = (
-                &cl_c, &ev_c, &ev_k, &next_ev, &next_cl, &ev_chunks, &cl_chunks, &ev_maps, &cl_maps, &products,
-                &campaigns,
-            );
-            let ln_out = &ln_out;
-            let pmap_slot = pmap_ptr.take();
+            let (cl_c, cl_u, ev_c, ev_u, ev_k, next_ev, next_cl) = (&cl_c, &cl_u, &ev_c, &ev_u, &ev_k, &next_ev, &next_cl);
+            let (ev_chunks, cl_chunks, ev_maps, cl_maps, products, campaigns) =
+                (&ev_chunks, &cl_chunks, &ev_maps, &cl_maps, &products, &campaigns);
+            let (ln_out, pm_cell) = (&ln_out, &pm_cell);
             s.spawn(move || {
-                if let Some(pm) = pmap_slot {
-                    *pm = build_pmap(ln_out, total_edges, pmap_cap);
+                if t == 0 {
+                    let _ = pm_cell.set(build_pmap(ln_out, total_edges, pmap_cap));
                     log(&t0, "  pmap built");
                 }
                 let mut ge = ev_c[t].lock().unwrap();
+                let mut gu = ev_u[t].lock().unwrap();
                 let mut gk = ev_k[t].lock().unwrap();
                 let mut ste = wc::Stager::<EvC, 8>::new(NP);
+                let mut stu = wc::Stager::<EvC, 8>::new(NP);
                 let mut stk = wc::Stager::<Cand, 8>::new(NPK);
+                let mut batch = [Row::default(); BATCH];
                 loop {
                     let ci = next_ev.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks.len() {
@@ -408,27 +415,65 @@ fn main() {
                     }
                     let (fi, s, e) = ev_chunks[ci];
                     let d: &[u8] = &ev_maps[fi][s..e];
-                    csv::for_rows::<7, _>(d, |f| {
-                        if f[0].is_empty() {
-                            return;
-                        }
-                        let r = parse_event(f, products, ws, we, unknown_cat);
-                        let loc = if r.valid {
-                            let p = (r.uh >> 56) as usize;
-                            let idx = (ge[p].len() + ste.pending(p)) as u64;
-                            ste.push(&mut ge, p, EvC { pkey: r.uh, name: r.user, w: r.w });
-                            (idx << (8 + thb)) | ((t as u64) << 8) | p as u64
-                        } else {
-                            LOC_NONE
+                    if let Some(pm) = pm_cell.get() {
+                        let pl = PLook::new(pm);
+                        let mut n = 0usize;
+                        let mut flush = |batch: &[Row], ge: &mut [Vec<EvC>], gk: &mut [Vec<Cand>]| {
+                            for r in batch {
+                                let loc = if r.valid {
+                                    let (pk, name) = pl.person(r.uh, r.user);
+                                    let p = (pk >> 56) as usize;
+                                    let idx = (ge[p].len() + ste.pending(p)) as u64;
+                                    ste.push(ge, p, EvC { pkey: pk, name, w: r.w });
+                                    (idx << (8 + thb)) | ((t as u64) << 8) | p as u64
+                                } else {
+                                    LOC_NONE
+                                };
+                                stk.push(gk, (r.eh >> (64 - NPK_BITS)) as usize, Cand::new(r.eh, r.ing, loc));
+                            }
                         };
-                        stk.push(&mut gk, (r.eh >> (64 - NPK_BITS)) as usize, Cand::new(r.eh, r.ing, loc));
-                    });
+                        csv::for_rows::<7, _>(d, |f| {
+                            if f[0].is_empty() {
+                                return;
+                            }
+                            let r = parse_event(f, products, ws, we, unknown_cat);
+                            if r.valid {
+                                pl.prefetch(r.uh);
+                            }
+                            batch[n] = r;
+                            n += 1;
+                            if n == BATCH {
+                                flush(&batch, &mut ge, &mut gk);
+                                n = 0;
+                            }
+                        });
+                        flush(&batch[..n], &mut ge, &mut gk);
+                    } else {
+                        let wi = (nt + t) as u64;
+                        csv::for_rows::<7, _>(d, |f| {
+                            if f[0].is_empty() {
+                                return;
+                            }
+                            let r = parse_event(f, products, ws, we, unknown_cat);
+                            let loc = if r.valid {
+                                let p = (r.uh >> 56) as usize;
+                                let idx = (gu[p].len() + stu.pending(p)) as u64;
+                                stu.push(&mut gu, p, EvC { pkey: r.uh, name: r.user, w: r.w });
+                                (idx << (8 + thb)) | (wi << 8) | p as u64
+                            } else {
+                                LOC_NONE
+                            };
+                            stk.push(&mut gk, (r.eh >> (64 - NPK_BITS)) as usize, Cand::new(r.eh, r.ing, loc));
+                        });
+                    }
                 }
                 ste.finish(&mut ge);
+                stu.finish(&mut gu);
                 stk.finish(&mut gk);
-                drop(ge);
-                drop(gk);
+                drop((ge, gu, gk));
                 let mut g = cl_c[t].lock().unwrap();
+                let mut gcu = cl_u[t].lock().unwrap();
+                let mut cb = [(0u64, ClC { pkey: 0, cid: Str(0), w: 0 }); BATCH];
                 loop {
                     let ci = next_cl.fetch_add(1, Ordering::Relaxed);
                     if ci >= cl_chunks.len() {
@@ -436,6 +481,15 @@ fn main() {
                     }
                     let (fi, s, e) = cl_chunks[ci];
                     let d: &[u8] = &cl_maps[fi][s..e];
+                    let pl = pm_cell.get().map(|pm| PLook::new(pm));
+                    let mut n = 0usize;
+                    let flush = |b: &[(u64, ClC)], g: &mut [Vec<ClC>]| {
+                        let pl = pl.as_ref().unwrap();
+                        for &(uh, c) in b {
+                            let (pk, _) = pl.person(uh, Str(0));
+                            g[(pk >> 56) as usize].push(ClC { pkey: pk, ..c });
+                        }
+                    };
                     csv::for_rows::<4, _>(d, |f| {
                         if f[0].is_empty() || f[1].is_empty() {
                             return;
@@ -446,18 +500,35 @@ fn main() {
                         }
                         let Some(camp) = campaigns.get(key128(f[2])) else { return };
                         let uh = hash64(key128(f[1]));
-                        g[(uh >> 56) as usize].push(ClC::new(uh, Str::of(f[0]), (t - cws) as u64, camp as u16));
+                        let c = ClC::new(uh, Str::of(f[0]), (t - cws) as u64, camp as u16);
+                        match &pl {
+                            Some(pl) => {
+                                pl.prefetch(uh);
+                                cb[n] = (uh, c);
+                                n += 1;
+                                if n == BATCH {
+                                    flush(&cb, &mut g);
+                                    n = 0;
+                                }
+                            }
+                            None => gcu[(uh >> 56) as usize].push(c),
+                        }
                     });
+                    if n > 0 {
+                        flush(&cb[..n], &mut g);
+                    }
                 }
             });
         }
     });
     drop(ln_out);
+    let pmap = pm_cell.into_inner().unwrap();
     log(&t0, "links + events A + clicks");
 
     // ---- events B: dedup candidates, mark every losing copy's payload dead ----
     let bases: Vec<usize> = ev_c
         .iter()
+        .chain(ev_u.iter())
         .flat_map(|m| m.lock().unwrap().iter_mut().map(|v| v.as_mut_ptr() as usize).collect::<Vec<_>>())
         .collect();
     let tmask = (1u64 << thb) - 1;
@@ -526,29 +597,17 @@ fn main() {
     // ---- person resolution: move linked users' records to their person's partition ----
     // pmap is indexed by the top bits of the user hash, so user partition p only probes its
     // own 1/NP slice of the table, which stays in L2.
-    let pmask = pmap.len() - 1;
-    let pshift = 64 - pmap.len().trailing_zeros();
-    let linked = |h: u64| -> Option<u64> {
-        let h_nz = h | 1;
-        let mut i = (h_nz >> pshift) as usize;
-        loop {
-            let (k, raw) = unsafe { *pmap.get_unchecked(i) };
-            if k == h_nz {
-                return Some(raw);
-            }
-            if k == 0 {
-                return None;
-            }
-            i = (i + 1) & pmask;
-        }
-    };
+    let pl = PLook::new(&pmap);
+    let linked = |h: u64| pl.linked(h);
     let pkey_of = |raw: u64| mum(raw ^ 0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9);
     let mut ev_c = split_parts(ev_c);
     let mut cl_c = split_parts(cl_c);
+    let ev_u = split_parts(ev_u);
+    let cl_u = split_parts(cl_u);
     // Moved buffers are sized for the worst case (every record moves) so they never regrow;
     // untouched capacity is never faulted in.
-    let n_ev: usize = ev_c.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
-    let n_cl: usize = cl_c.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
+    let n_ev: usize = ev_u.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
+    let n_cl: usize = cl_u.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
     let cap_e = n_ev / (nt * NP) + 64;
     let cap_c = n_cl / (nt * NP) + 64;
     let mv_e: Vec<Mutex<Vec<Vec<EvC>>>> =
@@ -559,7 +618,7 @@ fn main() {
     std::thread::scope(|s| {
         for t in 0..nt {
             let (mv_e, mv_c, ev_c, cl_c, next_p, linked, pkey_of) =
-                (&mv_e, &mv_c, &ev_c, &cl_c, &next_p, &linked, &pkey_of);
+                (&mv_e, &mv_c, &ev_u, &cl_u, &next_p, &linked, &pkey_of);
             s.spawn(move || {
                 let mut me = mv_e[t].lock().unwrap();
                 let mut mc = mv_c[t].lock().unwrap();
@@ -616,6 +675,8 @@ fn main() {
         let c: usize = mv_c.iter().map(|m| m.lock().unwrap().iter().map(|v| v.len()).sum::<usize>()).sum();
         eprintln!("moved ev {a} of {b}, moved clicks {c}");
     }
+    ev_c.extend(ev_u);
+    cl_c.extend(cl_u);
     ev_c.extend(split_parts(mv_e));
     cl_c.extend(split_parts(mv_c));
     log(&t0, "resolve");
@@ -640,7 +701,7 @@ fn main() {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
-        bucket_sort(&ev_c, p, |_| true, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
+        bucket_sort(&ev_c, p, |e| e.name.0 != 0, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc);
         let evs = &esc.out;
@@ -997,6 +1058,48 @@ fn sort_bucket<T: Copy>(
     let mask = if ib == 64 { u64::MAX } else { (1u64 << ib) - 1 };
     out.extend(keys.iter().map(|&k| unsafe { *b.get_unchecked((k & mask) as usize) }));
     true
+}
+
+const BATCH: usize = 16;
+
+/// Lookups in the person table: (hash | 1, root id string) slots, indexed by the top bits.
+struct PLook<'a> {
+    pm: &'a [(u64, u64)],
+    mask: usize,
+    shift: u32,
+}
+
+impl<'a> PLook<'a> {
+    fn new(pm: &'a [(u64, u64)]) -> Self {
+        PLook { pm, mask: pm.len() - 1, shift: 64 - pm.len().trailing_zeros() }
+    }
+    #[inline(always)]
+    fn linked(&self, h: u64) -> Option<u64> {
+        let h_nz = h | 1;
+        let mut i = (h_nz >> self.shift) as usize;
+        loop {
+            let (k, raw) = unsafe { *self.pm.get_unchecked(i) };
+            if k == h_nz {
+                return Some(raw);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// (person key, person name) of a user: its link root, or itself if unlinked.
+    #[inline(always)]
+    fn person(&self, h: u64, user: Str) -> (u64, Str) {
+        match self.linked(h) {
+            Some(raw) => (mum(raw ^ 0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9), Str(raw)),
+            None => (h, user),
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        csv::prefetch(unsafe { self.pm.as_ptr().add(((h | 1) >> self.shift) as usize) } as *const u8);
+    }
 }
 
 /// A parsed event row.
