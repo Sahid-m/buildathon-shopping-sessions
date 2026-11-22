@@ -169,3 +169,62 @@ impl KeyMap {
         *self = n;
     }
 }
+
+const fn masks() -> [[u64; 2]; 17] {
+    let mut m = [[0u64; 2]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let lo = if n >= 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+        let hi = if n >= 16 { u64::MAX } else if n <= 8 { 0 } else { (1u64 << ((n - 8) * 8)) - 1 };
+        m[n] = [lo, hi];
+        n += 1;
+    }
+    m
+}
+static IDMASK: [[u64; 2]; 17] = masks();
+
+#[inline(always)]
+fn rd8p(p: *const u8) -> u64 {
+    unsafe { (p as *const u64).read_unaligned() }
+}
+
+/// 64-bit hash of an ID's bytes (user and event IDs). Equal strings give equal hashes.
+/// IDs of up to 16 bytes take two masked 8-byte loads and one multiply, with no branch on
+/// the length; the loads may run past the slice but never past its 4 KB page (memory is
+/// mapped by whole pages), and a field near a page end is copied out first. An empty slice
+/// may have a dangling pointer, so it is never loaded.
+#[inline(always)]
+pub fn idhash(b: &[u8]) -> u64 {
+    let n = b.len();
+    let p = b.as_ptr();
+    if n <= 16 {
+        let (lo, hi) = if (n != 0) & ((p as usize & 0xFFF) <= 0xFF0) {
+            (rd8p(p), rd8p(unsafe { p.add(8) }))
+        } else {
+            idhash_copy(b)
+        };
+        let m = unsafe { IDMASK.get_unchecked(n) };
+        return mum((lo & m[0]) ^ P0, (hi & m[1]) ^ P1.wrapping_add((n as u64).wrapping_mul(P3)));
+    }
+    idhash_long(b)
+}
+
+#[cold]
+#[inline(never)]
+fn idhash_copy(b: &[u8]) -> (u64, u64) {
+    let mut buf = [0u8; 16];
+    buf[..b.len()].copy_from_slice(b);
+    (u64::from_le_bytes(buf[..8].try_into().unwrap()), u64::from_le_bytes(buf[8..].try_into().unwrap()))
+}
+
+#[inline(never)]
+fn idhash_long(b: &[u8]) -> u64 {
+    let n = b.len();
+    let mut h = P0 ^ (n as u64);
+    let mut i = 0;
+    while i + 16 < n {
+        h = mum(rd8(b, i) ^ P1 ^ h, rd8(b, i + 8) ^ P2);
+        i += 16;
+    }
+    mum(rd8(b, n - 16) ^ P3 ^ h, rd8(b, n - 8) ^ P0.wrapping_add(n as u64))
+}
