@@ -513,7 +513,7 @@ fn main() {
             }
             let r = &tmp[i];
             let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
+            push_pf(&mut g[(pkey >> 56) as usize], ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
         }
     });
     drop(cl_tmp);
@@ -596,7 +596,7 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        g[(pkey >> 56) as usize].push(EvC {
+                        push_pf(&mut g[(pkey >> 56) as usize], EvC {
                             pkey,
                             ts: ws + dt as i64,
                             name,
@@ -988,6 +988,16 @@ fn sort_bucket<T: Copy>(
     true
 }
 
+/// Pushes onto one of many partition Vecs, first pulling in the output line a few records
+/// ahead: hundreds of interleaved write streams defeat the hardware prefetcher, so each new
+/// line would otherwise stall a store on a cache miss.
+#[inline(always)]
+fn push_pf<T>(v: &mut Vec<T>, x: T) {
+    let ahead = (128 / std::mem::size_of::<T>().max(1)).max(1);
+    csv::prefetch(v.as_ptr().wrapping_add(v.len() + ahead) as *const u8);
+    v.push(x);
+}
+
 #[inline(always)]
 fn process_ev_chunk(
     ci: usize,
@@ -1042,11 +1052,7 @@ fn process_ev_chunk(
         }
         let p = (ehash >> 56) as usize;
         let uh = hash64(key128(f[1]));
-        let v = unsafe { g.get_unchecked_mut(p) };
-        // Pull the next output line of this partition in ahead of its write (256 streams
-        // defeat the hardware prefetcher, so each new line would otherwise stall a store).
-        csv::prefetch(v.as_ptr().wrapping_add(v.len() + 3) as *const u8);
-        v.push(EvA {
+        push_pf(unsafe { g.get_unchecked_mut(p) }, EvA {
             ehash,
             uh,
             ingest_cat: ing_u | ((cat as u64) << 52),
