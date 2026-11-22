@@ -371,7 +371,9 @@ fn main() {
     // ---- overlap union-find with events phase A ----
     let ev_chunks = chunks(&ev_maps, CH);
     let total_ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
-    let est_ev_per_part = (total_ev_bytes / 85 / nt.max(1) / NP).max(64);
+    // Sized ~1.4x the mean so threads that parse more rows rarely reallocate (a reallocation of
+    // these mmap-sized buffers is an mremap that interrupts every thread).
+    let est_ev_per_part = (total_ev_bytes / 60 / nt.max(1) / NP).max(64);
     let ev_a: Vec<Mutex<Vec<Vec<EvA>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
@@ -532,7 +534,7 @@ fn main() {
     // ---- clicks ----
     let cl_chunks = chunks(&cl_maps, CH);
     let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
-    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
+    let est_cl_per_part = (total_cl_bytes / 40 / nt.max(1) / NP).max(32);
     let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
         .collect();
@@ -634,6 +636,8 @@ fn main() {
                         }
                     }
 
+                    // Never free mid-run: a munmap here interrupts every thread (TLB shootdown).
+                    std::mem::forget(parts);
                     for i in 0..best.len() {
                         if i + PF < best.len() {
                             prefetch_person(best[i + PF].uh);
@@ -933,7 +937,7 @@ fn bucket_sort<T: Copy>(
         }
     }
     unsafe { scat.set_len(n) };
-    drop(workers);
+    std::mem::forget(workers);
     out.clear();
     out.reserve(n);
     let mut start = 0;
