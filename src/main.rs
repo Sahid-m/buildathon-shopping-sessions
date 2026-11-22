@@ -613,16 +613,8 @@ fn main() {
         .map(|_| Mutex::new(TOut { ud: Vec::with_capacity(65536), camp: vec![[0; 4]; (ncamp + 1) * ndays] }))
         .collect();
     par_for(nt, NP, |t, p| {
-        let mut evs: Vec<EvC> = Vec::with_capacity(ev_c.iter().map(|v| v[p].len()).sum());
-        for tv in &ev_c {
-            evs.extend_from_slice(&tv[p]);
-        }
-        evs.sort_unstable_by_key(|e| (e.pkey, e.ts));
-        let mut cls: Vec<ClC> = Vec::with_capacity(cl_c.iter().map(|v| v[p].len()).sum());
-        for tv in &cl_c {
-            cls.extend_from_slice(&tv[p]);
-        }
-        cls.sort_unstable_by(|a, b| {
+        let evs = bucket_sort(&ev_c, p, |e| e.pkey, |a, b| (a.pkey, a.ts).cmp(&(b.pkey, b.ts)));
+        let mut cls = bucket_sort(&cl_c, p, |c| c.pkey, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.ts.cmp(&b.ts))
@@ -789,6 +781,49 @@ fn main() {
         pq::write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows);
     });
     log(&t0, "done");
+}
+
+/// Gathers partition `p` from every thread's output and sorts it. The partition already
+/// shares the top 8 key bits, so a counting pass on the next 8 bits leaves small buckets
+/// that sort in L1.
+fn bucket_sort<T: Copy>(
+    workers: &[Vec<Vec<T>>],
+    p: usize,
+    key: impl Fn(&T) -> u64,
+    cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Copy,
+) -> Vec<T> {
+    let bucket = |v: &T| ((key(v) >> 48) & 255) as usize;
+    let mut ends = [0usize; 256];
+    for w in workers {
+        for v in &w[p] {
+            ends[bucket(v)] += 1;
+        }
+    }
+    let mut n = 0;
+    for e in ends.iter_mut() {
+        let c = *e;
+        *e = n;
+        n += c;
+    }
+    let mut out: Vec<T> = Vec::with_capacity(n);
+    let dst = out.as_mut_ptr();
+    for w in workers {
+        for v in &w[p] {
+            let o = &mut ends[bucket(v)];
+            // Prefix sums give each bucket a disjoint range with one slot per input.
+            unsafe { dst.add(*o).write(*v) };
+            *o += 1;
+        }
+    }
+    unsafe { out.set_len(n) };
+    let mut start = 0;
+    for &end in ends.iter() {
+        if end - start > 1 {
+            out[start..end].sort_unstable_by(cmp);
+        }
+        start = end;
+    }
+    out
 }
 
 #[inline(always)]
