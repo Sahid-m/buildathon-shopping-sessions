@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "2921d31:x86-64-v3 1b5477f:x86-64-v3 cb4e3f6:x86-64-v3"
+  VARIANTS: "cb4e3f6:x86-64-v3 cb4e3f6:x86-64-v3:NCPU=8 cb4e3f6:x86-64-v3:NCPU=6 cb4e3f6:x86-64-v3:NCPU=3"
 on:
   push:
     branches: [bench]
@@ -46,7 +46,7 @@ jobs:
           run() { # label, binary, env...
             local label=$1 bin=$2; shift 2
             rm -rf /tmp/out
-            env "$@" NCPU=4 /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB  minflt %R" $bin /dev/shm/s20 /tmp/out 2>/tmp/err
+            env NCPU=4 "$@" /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB  minflt %R" $bin /dev/shm/s20 /tmp/out 2>/tmp/err
             echo "== $label: $(grep WALL /tmp/err)"; grep -E 'ms\]' /tmp/err | tr '\n' ' ' | sed 's/  */ /g'; echo
           }
           for i in 1 2 3 4; do
