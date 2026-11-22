@@ -95,6 +95,12 @@ fn cmp_ts(b: &[u8], cnt: &mut [usize; 2]) {
     let a = ts::parse_ts(b);
     let e = ts::parse_ts_ref(b);
     assert_eq!(a, e, "ts mismatch on {:?}", String::from_utf8_lossy(b));
+    for pad in [b'0', b'-', b'Z'] {
+        let mut w = b.to_vec();
+        w.resize(b.len() + 32, pad);
+        let x = unsafe { ts::parse_ts_wide(&w[..b.len()]) };
+        assert_eq!(x, e, "wide ts mismatch on {:?}", String::from_utf8_lossy(b));
+    }
     cnt[a.is_some() as usize] += 1;
 }
 
