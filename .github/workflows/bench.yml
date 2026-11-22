@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "2921d31:x86-64-v3 216e25b:x86-64-v3 3b9499c:x86-64-v3 d5a83d8:x86-64-v3 2921d31:x86-64-v3:NCPU=1 3b9499c:x86-64-v3:NCPU=1"
+  VARIANTS: "2921d31:x86-64-v3 216e25b:x86-64-v3 1e54244:x86-64-v3 91dcbe6:x86-64-v3 216e25b:x86-64-v3:NCPU=1 91dcbe6:x86-64-v3:NCPU=1"
 on:
   push:
     branches: [x86a-bench]
