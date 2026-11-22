@@ -1,33 +1,60 @@
-//! Exact-or-hashed 128-bit keys for byte strings, and a small open-addressing map.
-//!
-//! Strings of up to 15 bytes are packed losslessly (bytes + length in the top byte), so
-//! equal keys mean equal strings. Longer strings get a 120-bit hash with the top byte
-//! set to 0xFF, so they never collide with packed keys.
+//! Exact-or-hashed 128-bit keys for byte strings (8-byte aligned), and a single-array open-addressing map.
 
 const P0: u64 = 0xa076_1d64_78bd_642f;
 const P1: u64 = 0xe703_7ed1_a0b4_28db;
 const P2: u64 = 0x8ebc_6af0_9c88_c6e3;
 const P3: u64 = 0x5899_65cc_7537_4cc3;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(C)]
+pub struct Key(pub [u64; 2]);
+
+impl Key {
+    #[inline(always)]
+    pub fn is_zero(&self) -> bool {
+        (self.0[0] | self.0[1]) == 0
+    }
+}
+
 #[inline(always)]
-fn mum(a: u64, b: u64) -> u64 {
-    let r = (a as u128) * (b as u128);
+pub fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128).wrapping_mul(b as u128);
     (r as u64) ^ ((r >> 64) as u64)
 }
 
 #[inline(always)]
 fn rd8(b: &[u8], i: usize) -> u64 {
-    u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+    unsafe { (b.as_ptr().add(i) as *const u64).read_unaligned() }
 }
 
-#[inline]
-pub fn key128(b: &[u8]) -> u128 {
+#[inline(always)]
+fn rd4(b: &[u8], i: usize) -> u64 {
+    unsafe { (b.as_ptr().add(i) as *const u32).read_unaligned() as u64 }
+}
+
+#[inline(always)]
+pub fn key128(b: &[u8]) -> Key {
     let n = b.len();
     if n <= 15 {
-        let mut buf = [0u8; 16];
-        buf[..n].copy_from_slice(b);
-        buf[15] = n as u8;
-        return u128::from_le_bytes(buf);
+        let w1_len = (n as u64) << 56;
+        if n > 8 {
+            let w0 = rd8(b, 0);
+            let w1 = (rd8(b, n - 8) >> ((16 - n) * 8)) | w1_len;
+            return Key([w0, w1]);
+        } else if n == 8 {
+            return Key([rd8(b, 0), w1_len]);
+        } else if n >= 4 {
+            let w0 = rd4(b, 0) | ((rd4(b, n - 4) >> ((8 - n) * 8)) << 32);
+            return Key([w0, w1_len]);
+        } else if n > 0 {
+            let b0 = unsafe { *b.get_unchecked(0) } as u64;
+            let b1 = unsafe { *b.get_unchecked(n >> 1) } as u64;
+            let b2 = unsafe { *b.get_unchecked(n - 1) } as u64;
+            let w0 = b0 | (b1 << ((n >> 1) * 8)) | (b2 << ((n - 1) * 8));
+            return Key([w0, w1_len]);
+        } else {
+            return Key([0, 0]);
+        }
     }
     let mut h1 = P0 ^ (n as u64);
     let mut h2 = P1.wrapping_add(n as u64);
@@ -45,76 +72,98 @@ pub fn key128(b: &[u8]) -> u128 {
     }
     h1 = mum(h1 ^ P3, h2 ^ P2) ^ h1;
     h2 = mum(h2 ^ P0, h1 ^ P1) ^ h2;
-    let k = ((h2 as u128) << 64) | (h1 as u128);
-    k | (0xFFu128 << 120)
+    Key([h1, h2 | (0xFFu64 << 56)])
 }
 
 #[inline(always)]
-pub fn hash64(k: u128) -> u64 {
-    mum((k as u64) ^ P0, ((k >> 64) as u64) ^ P1)
+pub fn hash64(k: Key) -> u64 {
+    mum(k.0[0] ^ P0, k.0[1] ^ P1)
 }
 
 #[inline(always)]
-pub fn part_of(k: u128) -> usize {
+pub fn part_of(k: Key) -> usize {
     (hash64(k) >> 56) as usize
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct Entry {
+    pub k: Key,
+    pub v: u64,
+}
+
 pub struct KeyMap {
-    keys: Vec<u128>,
-    vals: Vec<u32>,
-    mask: usize,
-    len: usize,
+    pub entries: Vec<Entry>,
+    pub mask: usize,
+    pub len: usize,
 }
 
 impl KeyMap {
     pub fn with_capacity(n: usize) -> KeyMap {
         let cap = (n * 2).next_power_of_two().max(16);
-        KeyMap { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1, len: 0 }
+        KeyMap {
+            entries: vec![Entry::default(); cap],
+            mask: cap - 1,
+            len: 0,
+        }
     }
-    #[inline]
-    pub fn get(&self, k: u128) -> Option<u32> {
-        if k == 0 {
+
+    #[inline(always)]
+    pub fn get(&self, k: Key) -> Option<u64> {
+        self.get_with_hash(k, hash64(k))
+    }
+
+    #[inline(always)]
+    pub fn get_with_hash(&self, k: Key, h: u64) -> Option<u64> {
+        if k.is_zero() {
             return None;
         }
-        let mut i = hash64(k) as usize & self.mask;
+        let mut i = h as usize & self.mask;
         loop {
-            let x = self.keys[i];
-            if x == k {
-                return Some(self.vals[i]);
+            let e = unsafe { self.entries.get_unchecked(i) };
+            if e.k == k {
+                return Some(e.v);
             }
-            if x == 0 {
+            if e.k.is_zero() {
                 return None;
             }
             i = (i + 1) & self.mask;
         }
     }
-    /// Inserts k -> v unless k is present. Returns the existing value if present.
-    #[inline]
-    pub fn insert_if_absent(&mut self, k: u128, v: u32) -> Option<u32> {
-        debug_assert!(k != 0);
-        if (self.len + 1) * 2 > self.keys.len() {
+
+    /// Inserts k -> v unless k is present. Returns (existing_or_new_v, was_present).
+    #[inline(always)]
+    pub fn get_or_insert(&mut self, k: Key, v: u64) -> (u64, bool) {
+        if (self.len + 1) * 2 > self.entries.len() {
             self.grow();
         }
         let mut i = hash64(k) as usize & self.mask;
         loop {
-            let x = self.keys[i];
-            if x == k {
-                return Some(self.vals[i]);
+            let e = unsafe { self.entries.get_unchecked_mut(i) };
+            if e.k == k {
+                return (e.v, true);
             }
-            if x == 0 {
-                self.keys[i] = k;
-                self.vals[i] = v;
+            if e.k.is_zero() {
+                e.k = k;
+                e.v = v;
                 self.len += 1;
-                return None;
+                return (v, false);
             }
             i = (i + 1) & self.mask;
         }
     }
+
+    #[inline(always)]
+    pub fn insert_if_absent(&mut self, k: Key, v: u64) -> Option<u64> {
+        let (old, present) = self.get_or_insert(k, v);
+        if present { Some(old) } else { None }
+    }
+
     fn grow(&mut self) {
-        let mut n = KeyMap::with_capacity(self.keys.len());
-        for (i, &k) in self.keys.iter().enumerate() {
-            if k != 0 {
-                n.insert_if_absent(k, self.vals[i]);
+        let mut n = KeyMap::with_capacity(self.entries.len());
+        for e in &self.entries {
+            if !e.k.is_zero() {
+                n.get_or_insert(e.k, e.v);
             }
         }
         *self = n;
