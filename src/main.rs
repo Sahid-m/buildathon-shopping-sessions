@@ -754,7 +754,7 @@ fn main() {
                     if n == 0 {
                         continue;
                     }
-                    let cap = (n * 2).next_power_of_two().max(16);
+                    let cap = (n + n / 3).next_power_of_two().max(16);
                     let mask = cap - 1;
                     if tab.len() < cap {
                         tab.resize(cap, 0);
