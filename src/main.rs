@@ -220,10 +220,10 @@ fn chunks(maps: &[Mmap], target: usize) -> Vec<(usize, usize, usize)> {
 
 /// Runs `f(t, i)` for i in 0..n across `nt` threads with dynamic scheduling.
 /// log2 of the partition count: about one partition per EV_PER_PART events (estimated at
-/// ~85 bytes per event line), rounded to the nearest power of two and clamped. SS_NPBITS
-/// overrides it for benchmarking.
-fn np_bits(total_ev_bytes: usize) -> u32 {
-    if let Some(b) = std::env::var("SS_NPBITS").ok().and_then(|v| v.parse::<u32>().ok()) {
+/// ~85 bytes per event line), rounded to the nearest power of two and clamped. The env var
+/// `var` overrides it for benchmarking.
+fn np_bits(total_ev_bytes: usize, var: &str) -> u32 {
+    if let Some(b) = std::env::var(var).ok().and_then(|v| v.parse::<u32>().ok()) {
         return b.clamp(4, 12);
     }
     let target = (total_ev_bytes / 85 / EV_PER_PART).max(1) as u64;
@@ -389,13 +389,17 @@ fn main() {
     // ---- overlap union-find with events phase A ----
     let ev_chunks = chunks(&ev_maps, CH);
     let total_ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
-    let npbits = np_bits(total_ev_bytes);
-    let np = 1usize << npbits;
-    // Partition index = top npbits of a 64-bit hash.
-    let psh = 64 - npbits;
-    let est_ev_per_part = (total_ev_bytes / 85 / nt.max(1) / np).max(64);
+    // Two independent partitionings, each indexed by the top bits of a 64-bit hash: events A
+    // scatters by event id for the events-B dedup (npa parts), and events B and clicks
+    // scatter by person for phase C (npc parts).
+    let npa_bits = np_bits(total_ev_bytes, "SS_NPABITS");
+    let npc_bits = np_bits(total_ev_bytes, "SS_NPCBITS");
+    let (npa, npc) = (1usize << npa_bits, 1usize << npc_bits);
+    let (psha, pshc) = (64 - npa_bits, 64 - npc_bits);
+    let est_ev_per_part = (total_ev_bytes / 85 / nt.max(1) / npa).max(64);
+    let est_evc_per_part = (total_ev_bytes / 85 / nt.max(1) / npc).max(64);
     let ev_a: Vec<Mutex<Vec<Vec<EvA>>>> = (0..nt)
-        .map(|_| Mutex::new((0..np).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
+        .map(|_| Mutex::new((0..npa).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
 
     let total_edges: usize = ln_out.iter().map(|m| m.lock().unwrap().len()).sum();
@@ -479,7 +483,7 @@ fn main() {
 
             // Help process remaining event chunks
             let mut g = ev_a_ref[0].lock().unwrap();
-                let mut st = wc::Stager::<EvA, 8>::new(np);
+                let mut st = wc::Stager::<EvA, 8>::new(npa);
             loop {
                 let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                 if ci >= ev_chunks_ref.len() {
@@ -493,7 +497,7 @@ fn main() {
                     ws,
                     we,
                     unknown_cat,
-                    psh,
+                    psha,
                     &mut g,
                     &mut st,
                 );
@@ -504,7 +508,7 @@ fn main() {
         for t in 1..nt {
             s.spawn(move || {
                 let mut g = ev_a_ref[t].lock().unwrap();
-                let mut st = wc::Stager::<EvA, 8>::new(np);
+                let mut st = wc::Stager::<EvA, 8>::new(npa);
                 loop {
                     let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks_ref.len() {
@@ -518,7 +522,7 @@ fn main() {
                         ws,
                         we,
                         unknown_cat,
-                        psh,
+                        psha,
                         &mut g,
                         &mut st,
                     );
@@ -556,9 +560,9 @@ fn main() {
     // ---- clicks ----
     let cl_chunks = chunks(&cl_maps, CH);
     let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
-    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / np).max(32);
+    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / npc).max(32);
     let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..np).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
+        .map(|_| Mutex::new((0..npc).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
         .collect();
     let cl_tmp: Vec<Mutex<Vec<ClB>>> = (0..nt).map(|_| Mutex::new(Vec::new())).collect();
     par_for(nt, cl_chunks.len(), |t, ci| {
@@ -585,7 +589,7 @@ fn main() {
             }
             let r = &tmp[i];
             let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> psh) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
+            g[(pkey >> pshc) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
         }
     });
     drop(cl_tmp);
@@ -594,7 +598,7 @@ fn main() {
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
     let ev_a = split_parts(ev_a);
     let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
-        .map(|_| Mutex::new((0..np).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
+        .map(|_| Mutex::new((0..npc).map(|_| Vec::with_capacity(est_evc_per_part)).collect()))
         .collect();
     let next_p = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -608,10 +612,10 @@ fn main() {
                 let mut tab: Vec<u64> = Vec::new();
                 let mut best: Vec<EvA> = Vec::new();
                 let mut g = ev_c_ref[t].lock().unwrap();
-                let mut st = wc::Stager::<EvC, 8>::new(np);
+                let mut st = wc::Stager::<EvC, 8>::new(npc);
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
-                    if p >= np {
+                    if p >= npa {
                         break;
                     }
                     let parts = take_part(ev_a_ref, p);
@@ -669,7 +673,7 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        st.push(&mut g, (pkey >> psh) as usize, EvC::new(pkey, name, dt, price, r.cat()));
+                        st.push(&mut g, (pkey >> pshc) as usize, EvC::new(pkey, name, dt, price, r.cat()));
                     }
                 }
                 st.finish(&mut g);
@@ -696,10 +700,10 @@ fn main() {
         .collect();
     let scratch: Vec<Mutex<(Scratch<EvC>, Scratch<ClC>)>> =
         (0..nt).map(|_| Mutex::new((Scratch::new(), Scratch::new()))).collect();
-    let order = lpt_order(&ev_c, &cl_c, np);
+    let order = lpt_order(&ev_c, &cl_c, npc);
     // Phase C buckets: the 12 hash bits just below the partition bits.
-    let bsh = psh - 12;
-    par_for(nt, np, |t, pi| {
+    let bsh = pshc - 12;
+    par_for(nt, npc, |t, pi| {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
