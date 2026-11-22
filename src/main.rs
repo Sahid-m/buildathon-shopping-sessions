@@ -571,7 +571,9 @@ fn main() {
     let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
         .collect();
-    par_for(nt, NP, |t, q| {
+    let order = lpt_order(&ev_b, &cl_b);
+    par_for(nt, NP, |t, qi| {
+        let q = order[qi];
         {
             let mut g = ev_c[t].lock().unwrap();
             for tv in take_part(&ev_b, q) {
@@ -606,6 +608,8 @@ fn main() {
     let ev_c = split_parts(ev_c);
     let cl_c = split_parts(cl_c);
     let ncat = cat_names.len();
+    // Bits for a timestamp offset from the click window start (covers events too).
+    let tb = 64 - ((we - cws - 1).max(1) as u64).leading_zeros();
     struct TOut {
         ud: Vec<UdRow>,
         camp: Vec<[i64; 4]>,
@@ -613,14 +617,37 @@ fn main() {
     let touts: Vec<Mutex<TOut>> = (0..nt)
         .map(|_| Mutex::new(TOut { ud: Vec::with_capacity(65536), camp: vec![[0; 4]; (ncamp + 1) * ndays] }))
         .collect();
-    par_for(nt, NP, |t, p| {
-        let evs = bucket_sort(&ev_c, p, |e| e.pkey, |a, b| (a.pkey, a.ts).cmp(&(b.pkey, b.ts)));
-        let mut cls = bucket_sort(&cl_c, p, |c| c.pkey, |a, b| {
+    let scratch: Vec<Mutex<(Scratch<EvC>, Scratch<ClC>)>> =
+        (0..nt).map(|_| Mutex::new((Scratch::new(), Scratch::new()))).collect();
+    let order = lpt_order(&ev_c, &cl_c);
+    par_for(nt, NP, |t, pi| {
+        let p = order[pi];
+        let mut scr = scratch[t].lock().unwrap();
+        let (esc, csc) = &mut *scr;
+        bucket_sort(&ev_c, p, |e| e.pkey, |e| (e.ts - cws) as u64, tb, |a, b| {
+            (a.pkey, a.ts).cmp(&(b.pkey, b.ts))
+        }, esc);
+        let evs = &esc.out;
+        bucket_sort(&cl_c, p, |c| c.pkey, |c| (c.ts - cws) as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.ts.cmp(&b.ts))
                 .then_with(|| a.cid.get().cmp(b.cid.get()))
-        });
+        }, csc);
+        let cls = &mut csc.out;
+        // The packed sort keeps equal (pkey, ts) clicks in input order; order those runs by
+        // click_id so the dedup below sees copies side by side.
+        let mut a = 0;
+        while a < cls.len() {
+            let mut z = a + 1;
+            while z < cls.len() && cls[z].pkey == cls[a].pkey && cls[z].ts == cls[a].ts {
+                z += 1;
+            }
+            if z - a > 1 {
+                cls[a..z].sort_unstable_by(|x, y| x.cid.get().cmp(y.cid.get()));
+            }
+            a = z;
+        }
         cls.dedup_by(|a, b| a.pkey == b.pkey && a.ts == b.ts && a.cid.get() == b.cid.get());
 
         let mut g = touts[t].lock().unwrap();
@@ -782,6 +809,20 @@ fn main() {
         pq::write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows);
     });
     log(&t0, "done");
+    // Skip freeing the large buffers; the OS reclaims them at exit.
+    std::process::exit(0);
+}
+
+/// Partition indices, largest first (sizes summed over threads), so whale partitions start
+/// early and do not leave one thread running alone at the end.
+fn lpt_order<T, U>(a: &Parts<T>, b: &Parts<U>) -> Vec<usize> {
+    let size = |p: usize| -> usize {
+        a.iter().map(|w| w[p].lock().unwrap().len()).sum::<usize>()
+            + b.iter().map(|w| w[p].lock().unwrap().len()).sum::<usize>()
+    };
+    let mut v: Vec<(usize, usize)> = (0..NP).map(|p| (size(p), p)).collect();
+    v.sort_unstable_by(|x, y| y.cmp(x));
+    v.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Per-thread, per-partition buffers; each partition is taken (and freed) by its one consumer.
@@ -796,15 +837,21 @@ fn take_part<T>(parts: &Parts<T>, p: usize) -> Vec<Vec<T>> {
     parts.iter().map(|w| std::mem::take(&mut *w[p].lock().unwrap())).collect()
 }
 
-/// Gathers partition `p` from every thread's output and sorts it. The partition already
-/// shares the top 8 key bits, so a counting pass on the next 12 bits leaves buckets of
-/// about one person each, which sort with a few insertion-sort steps.
+/// Gathers partition `p` from every thread's output and sorts it by (pkey, ts). The partition
+/// already shares the top 8 key bits, so a counting pass on the next 12 bits leaves buckets of
+/// one or a few persons. Each bucket is then sorted as packed u64 keys
+/// `rank(pkey) | ts offset | index` (u64 sorts use branchless networks), and the records are
+/// gathered in key order. Records with equal (pkey, ts) come out in input order. A bucket whose
+/// keys do not fit 64 bits falls back to a comparison sort with `cmp`.
 fn bucket_sort<T: Copy>(
     parts: &Parts<T>,
     p: usize,
     key: impl Fn(&T) -> u64,
+    tsoff: impl Fn(&T) -> u64,
+    tb: u32,
     cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Copy,
-) -> Vec<T> {
+    sc: &mut Scratch<T>,
+) {
     let bucket = |v: &T| ((key(v) >> 44) & 4095) as usize;
     let workers = take_part(parts, p);
     let mut ends = vec![0usize; 4096];
@@ -819,8 +866,10 @@ fn bucket_sort<T: Copy>(
         *e = n;
         n += c;
     }
-    let mut out: Vec<T> = Vec::with_capacity(n);
-    let dst = out.as_mut_ptr();
+    let Scratch { scat, out, keys, pks } = sc;
+    scat.clear();
+    scat.reserve(n);
+    let dst = scat.as_mut_ptr();
     for w in &workers {
         for v in w {
             let o = &mut ends[bucket(v)];
@@ -829,15 +878,104 @@ fn bucket_sort<T: Copy>(
             *o += 1;
         }
     }
-    unsafe { out.set_len(n) };
+    unsafe { scat.set_len(n) };
+    drop(workers);
+    out.clear();
+    out.reserve(n);
     let mut start = 0;
     for &end in ends.iter() {
-        if end - start > 1 {
-            out[start..end].sort_unstable_by(cmp);
-        }
+        let b = &scat[start..end];
         start = end;
+        if b.len() <= SMALL {
+            // Stable insertion sort by (key, tsoff): ties keep input order, as the packed
+            // keys do.
+            let o = out.len();
+            out.extend_from_slice(b);
+            let t = &mut out[o..];
+            for i in 1..t.len() {
+                let v = t[i];
+                let kv = (key(&v), tsoff(&v));
+                let mut j = i;
+                while j > 0 && (key(&t[j - 1]), tsoff(&t[j - 1])) > kv {
+                    t[j] = t[j - 1];
+                    j -= 1;
+                }
+                t[j] = v;
+            }
+            continue;
+        }
+        if !sort_bucket(b, &key, &tsoff, tb, keys, pks, out) {
+            let o = out.len();
+            out.extend_from_slice(b);
+            out[o..].sort_unstable_by(cmp);
+        }
     }
-    out
+}
+
+/// Per-thread buffers for `bucket_sort`, reused across partitions to avoid fresh page faults.
+struct Scratch<T> {
+    scat: Vec<T>,
+    out: Vec<T>,
+    keys: Vec<u64>,
+    pks: Vec<u64>,
+}
+
+impl<T> Scratch<T> {
+    fn new() -> Self {
+        Scratch { scat: vec![], out: vec![], keys: vec![], pks: vec![] }
+    }
+}
+
+/// Buckets up to this size are insertion-sorted in place instead of via packed keys.
+const SMALL: usize = 8;
+
+/// Appends `b` sorted by (key, tsoff, input index) to `out`; false (nothing appended) if the
+/// packed keys would not fit in 64 bits.
+#[inline(always)]
+fn sort_bucket<T: Copy>(
+    b: &[T],
+    key: &impl Fn(&T) -> u64,
+    tsoff: &impl Fn(&T) -> u64,
+    tb: u32,
+    keys: &mut Vec<u64>,
+    pks: &mut Vec<u64>,
+    out: &mut Vec<T>,
+) -> bool {
+    let n = b.len();
+    let ib = 64 - ((n - 1) as u64).leading_zeros();
+    if tb + ib > 64 {
+        return false;
+    }
+    let rb = 64 - tb - ib;
+    let k0 = key(&b[0]);
+    let single = b.iter().all(|v| key(v) == k0);
+    keys.clear();
+    if single {
+        keys.extend(b.iter().enumerate().map(|(i, v)| (tsoff(v) << ib) | i as u64));
+    } else {
+        if rb == 0 {
+            return false;
+        }
+        pks.clear();
+        pks.extend(b.iter().map(key));
+        pks.sort_unstable();
+        pks.dedup();
+        if rb < 64 && pks.len() as u64 > (1u64 << rb) {
+            return false;
+        }
+        let sh = tb + ib;
+        keys.extend(b.iter().enumerate().map(|(i, v)| {
+            let r = match pks.binary_search(&key(v)) {
+                Ok(r) => r as u64,
+                Err(_) => unreachable!(),
+            };
+            (r << sh) | (tsoff(v) << ib) | i as u64
+        }));
+    }
+    keys.sort_unstable();
+    let mask = if ib == 64 { u64::MAX } else { (1u64 << ib) - 1 };
+    out.extend(keys.iter().map(|&k| unsafe { *b.get_unchecked((k & mask) as usize) }));
+    true
 }
 
 #[inline(always)]
