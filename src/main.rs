@@ -542,35 +542,77 @@ fn main() {
     let pkey_of = |raw: u64| mum(raw ^ 0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9);
     let mut ev_c = split_parts(ev_c);
     let mut cl_c = split_parts(cl_c);
-    let mv_e: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt).map(|_| Mutex::new((0..NP).map(|_| Vec::new()).collect())).collect();
-    let mv_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt).map(|_| Mutex::new((0..NP).map(|_| Vec::new()).collect())).collect();
-    par_for(nt, NP, |t, p| {
-        let mut me = mv_e[t].lock().unwrap();
-        let mut mc = mv_c[t].lock().unwrap();
-        for w in &ev_c {
-            let mut v = w[p].lock().unwrap();
-            for e in v.iter_mut() {
-                if e.name.0 == 0 {
-                    continue;
+    // Moved buffers are sized for the worst case (every record moves) so they never regrow;
+    // untouched capacity is never faulted in.
+    let n_ev: usize = ev_c.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
+    let n_cl: usize = cl_c.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
+    let cap_e = n_ev / (nt * NP) + 64;
+    let cap_c = n_cl / (nt * NP) + 64;
+    let mv_e: Vec<Mutex<Vec<Vec<EvC>>>> =
+        (0..nt).map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(cap_e)).collect())).collect();
+    let mv_c: Vec<Mutex<Vec<Vec<ClC>>>> =
+        (0..nt).map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(cap_c)).collect())).collect();
+    let next_p = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for t in 0..nt {
+            let (mv_e, mv_c, ev_c, cl_c, next_p, linked, pkey_of) =
+                (&mv_e, &mv_c, &ev_c, &cl_c, &next_p, &linked, &pkey_of);
+            s.spawn(move || {
+                let mut me = mv_e[t].lock().unwrap();
+                let mut mc = mv_c[t].lock().unwrap();
+                let mut ste = wc::Stager::<EvC, 8>::new(NP);
+                let mut stc = wc::Stager::<ClC, 8>::new(NP);
+                loop {
+                    let p = next_p.fetch_add(1, Ordering::Relaxed);
+                    if p >= NP {
+                        break;
+                    }
+                    // Keeps unlinked live records in place (compacted), moves linked ones.
+                    for w in ev_c {
+                        let mut v = w[p].lock().unwrap();
+                        let mut k = 0;
+                        for i in 0..v.len() {
+                            let e = unsafe { *v.get_unchecked(i) };
+                            if e.name.0 == 0 {
+                                continue;
+                            }
+                            if let Some(raw) = linked(e.pkey) {
+                                let pk = pkey_of(raw);
+                                ste.push(&mut me, (pk >> 56) as usize, EvC { pkey: pk, name: Str(raw), w: e.w });
+                            } else {
+                                unsafe { *v.get_unchecked_mut(k) = e };
+                                k += 1;
+                            }
+                        }
+                        v.truncate(k);
+                    }
+                    for w in cl_c {
+                        let mut v = w[p].lock().unwrap();
+                        let mut k = 0;
+                        for i in 0..v.len() {
+                            let c = unsafe { *v.get_unchecked(i) };
+                            if let Some(raw) = linked(c.pkey) {
+                                let pk = pkey_of(raw);
+                                stc.push(&mut mc, (pk >> 56) as usize, ClC { pkey: pk, cid: c.cid, w: c.w });
+                            } else {
+                                unsafe { *v.get_unchecked_mut(k) = c };
+                                k += 1;
+                            }
+                        }
+                        v.truncate(k);
+                    }
                 }
-                if let Some(raw) = linked(e.pkey) {
-                    let pk = pkey_of(raw);
-                    me[(pk >> 56) as usize].push(EvC { pkey: pk, name: Str(raw), w: e.w });
-                    e.name.0 = 0;
-                }
-            }
-        }
-        for w in &cl_c {
-            let mut v = w[p].lock().unwrap();
-            for c in v.iter_mut() {
-                if let Some(raw) = linked(c.pkey) {
-                    let pk = pkey_of(raw);
-                    mc[(pk >> 56) as usize].push(ClC { pkey: pk, cid: c.cid, w: c.w });
-                    c.cid.0 = 0;
-                }
-            }
+                ste.finish(&mut me);
+                stc.finish(&mut mc);
+            });
         }
     });
+    if std::env::var_os("SS_STATS").is_some() {
+        let a: usize = mv_e.iter().map(|m| m.lock().unwrap().iter().map(|v| v.len()).sum::<usize>()).sum();
+        let b: usize = ev_c.iter().map(|w| w.iter().map(|v| v.lock().unwrap().len()).sum::<usize>()).sum();
+        let c: usize = mv_c.iter().map(|m| m.lock().unwrap().iter().map(|v| v.len()).sum::<usize>()).sum();
+        eprintln!("moved ev {a} of {b}, moved clicks {c}");
+    }
     ev_c.extend(split_parts(mv_e));
     cl_c.extend(split_parts(mv_c));
     log(&t0, "resolve");
@@ -595,11 +637,11 @@ fn main() {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
-        bucket_sort(&ev_c, p, |e| e.name.0 != 0, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
+        bucket_sort(&ev_c, p, |_| true, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc);
         let evs = &esc.out;
-        bucket_sort(&cl_c, p, |c| c.cid.0 != 0, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
+        bucket_sort(&cl_c, p, |_| true, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.dt().cmp(&b.dt()))
