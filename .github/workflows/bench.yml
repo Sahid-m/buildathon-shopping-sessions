@@ -3,11 +3,10 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "4b93fd0:x86-64-v3 5b103b8:x86-64-v3"
+  VARIANTS: "4b93fd0:x86-64-v3 7fcdbdf:x86-64-v3:SS_NPBITS=8 7fcdbdf:x86-64-v3:SS_NPBITS=9 7fcdbdf:x86-64-v3:SS_NPBITS=10 7fcdbdf:x86-64-v3"
 on:
   push:
-    branches: [bench]
-    paths: ['.github/workflows/bench.yml']
+    branches: [np-bench]
   workflow_dispatch:
     inputs:
       shas:
@@ -16,7 +15,7 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,3 +60,29 @@ jobs:
           set -- $SHAS
           i=0; for s in "$@"; do i=$((i+1)); sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); rm -rf /tmp/o-$i; SS_QUIET=1 /tmp/b-$sha-$cpu/target/release/sessions /dev/shm/s20 /tmp/o-$i; done
           for j in $(seq 2 $i); do python3 /tmp/src-$(echo $1 | cut -d: -f1)/scripts/compare.py /tmp/o-1 /tmp/o-$j 2>&1 | tail -1; done
+      - name: generate 60M into tmpfs
+        run: |
+          rm -rf /dev/shm/s20 /tmp/o-*
+          time tools/generator/target/release/generate --seed 11 --events 60000000 --clicks 15000000 --output /dev/shm/s60
+          du -sh /dev/shm/s60; free -g
+      - name: time 60M
+        run: |
+          V60="4b93fd0:x86-64-v3 7fcdbdf:x86-64-v3:SS_NPBITS=8 7fcdbdf:x86-64-v3:SS_NPBITS=9 7fcdbdf:x86-64-v3:SS_NPBITS=10 7fcdbdf:x86-64-v3:SS_NPBITS=11"
+          run() {
+            local label=$1 bin=$2; shift 2
+            rm -rf /tmp/out
+            env NCPU=4 "$@" /usr/bin/time -f "WALL %e s  user %U  sys %S  maxrss %M KB  minflt %R" $bin /dev/shm/s60 /tmp/out 2>/tmp/err
+            echo "== 60M $label: $(grep WALL /tmp/err)"; grep -E 'ms\]' /tmp/err | tr '\n' ' ' | sed 's/  */ /g'; echo
+          }
+          for i in 1 2 3; do
+            for s in $V60; do
+              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3)
+              run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
+            done
+          done
+      - name: check 60M outputs agree
+        run: |
+          rm -rf /tmp/o-a /tmp/o-b /tmp/out
+          SS_QUIET=1 /tmp/b-4b93fd0-x86-64-v3/target/release/sessions /dev/shm/s60 /tmp/o-a
+          SS_QUIET=1 /tmp/b-7fcdbdf-x86-64-v3/target/release/sessions /dev/shm/s60 /tmp/o-b
+          python3 /tmp/src-4b93fd0/scripts/compare.py /tmp/o-a /tmp/o-b 2>&1 | tail -1
