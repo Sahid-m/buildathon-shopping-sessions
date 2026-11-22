@@ -21,6 +21,9 @@ pub const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const NP: usize = 256;
+/// Event-id partitions for dedup candidates (more of them keep each dedup table in L2).
+const NPK_BITS: u32 = 10;
+const NPK: usize = 1 << NPK_BITS;
 
 #[derive(Clone, Copy, Default)]
 #[repr(transparent)]
@@ -376,7 +379,7 @@ fn main() {
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
     let ev_k: Vec<Mutex<Vec<Vec<Cand>>>> = (0..nt)
-        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
+        .map(|_| Mutex::new((0..NPK).map(|_| Vec::with_capacity(est_ev_per_part * NP / NPK + 16)).collect()))
         .collect();
     let next_ev = AtomicUsize::new(0);
     let next_cl = AtomicUsize::new(0);
@@ -397,7 +400,7 @@ fn main() {
                 let mut ge = ev_c[t].lock().unwrap();
                 let mut gk = ev_k[t].lock().unwrap();
                 let mut ste = wc::Stager::<EvC, 8>::new(NP);
-                let mut stk = wc::Stager::<Cand, 8>::new(NP);
+                let mut stk = wc::Stager::<Cand, 8>::new(NPK);
                 loop {
                     let ci = next_ev.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks.len() {
@@ -418,7 +421,7 @@ fn main() {
                         } else {
                             LOC_NONE
                         };
-                        stk.push(&mut gk, (r.eh >> 56) as usize, Cand::new(r.eh, r.ing, loc));
+                        stk.push(&mut gk, (r.eh >> (64 - NPK_BITS)) as usize, Cand::new(r.eh, r.ing, loc));
                     });
                 }
                 ste.finish(&mut ge);
@@ -469,7 +472,7 @@ fn main() {
     };
     let ev_k = split_parts(ev_k);
     let dd_tabs: Vec<Mutex<(Vec<u64>, Vec<Cand>)>> = (0..nt).map(|_| Mutex::new((vec![], vec![]))).collect();
-    par_for(nt, NP, |t, p| {
+    par_for(nt, NPK, |t, p| {
         let mut g = dd_tabs[t].lock().unwrap();
         let (tab, best) = &mut *g;
         let parts = take_part(&ev_k, p);
