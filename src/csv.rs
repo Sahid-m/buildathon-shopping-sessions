@@ -112,7 +112,7 @@ pub fn parse_price(b: &[u8]) -> Option<u32> {
 /// (separator mask, quote mask) for the 64 bytes at `p`. Bit i is byte i.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn masks64(p: *const u8) -> (u64, u64) {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     use core::arch::aarch64::*;
     unsafe {
         #[inline(always)]
@@ -134,32 +134,36 @@ unsafe fn masks64(p: *const u8) -> (u64, u64) {
         let cm = vdupq_n_u8(b',');
         let nl = vdupq_n_u8(b'\n');
         let qt = vdupq_n_u8(b'"');
-        let sa = vorrq_u8(vceqq_u8(a, cm), vceqq_u8(a, nl));
-        let sb = vorrq_u8(vceqq_u8(b, cm), vceqq_u8(b, nl));
-        let sc = vorrq_u8(vceqq_u8(c, cm), vceqq_u8(c, nl));
-        let sd = vorrq_u8(vceqq_u8(d, cm), vceqq_u8(d, nl));
+        let nla = vceqq_u8(a, nl);
+        let nlb = vceqq_u8(b, nl);
+        let nlc = vceqq_u8(c, nl);
+        let nld = vceqq_u8(d, nl);
+        let sa = vorrq_u8(vceqq_u8(a, cm), nla);
+        let sb = vorrq_u8(vceqq_u8(b, cm), nlb);
+        let sc = vorrq_u8(vceqq_u8(c, cm), nlc);
+        let sd = vorrq_u8(vceqq_u8(d, cm), nld);
         let sep = bits(sa, sb, sc, sd);
         let quo = bits(vceqq_u8(a, qt), vceqq_u8(b, qt), vceqq_u8(c, qt), vceqq_u8(d, qt));
-        (sep, quo)
+        (sep, quo, bits(nla, nlb, nlc, nld))
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[inline(always)]
-unsafe fn masks64(p: *const u8) -> (u64, u64) {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
     unsafe {
         let v = _mm512_loadu_si512(p as *const _);
-        let sep = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8))
-            | _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        let nl = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        let sep = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)) | nl;
         let quo = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
-        (sep, quo)
+        (sep, quo, nl)
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
-unsafe fn masks64(p: *const u8) -> (u64, u64) {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
     unsafe {
         let lo = _mm256_loadu_si256(p as *const __m256i);
@@ -167,43 +171,50 @@ unsafe fn masks64(p: *const u8) -> (u64, u64) {
         let cm = _mm256_set1_epi8(b',' as i8);
         let nl = _mm256_set1_epi8(b'\n' as i8);
         let qt = _mm256_set1_epi8(b'"' as i8);
-        let slo = _mm256_or_si256(_mm256_cmpeq_epi8(lo, cm), _mm256_cmpeq_epi8(lo, nl));
-        let shi = _mm256_or_si256(_mm256_cmpeq_epi8(hi, cm), _mm256_cmpeq_epi8(hi, nl));
-        let sep = (_mm256_movemask_epi8(slo) as u32 as u64) | ((_mm256_movemask_epi8(shi) as u32 as u64) << 32);
+        let clo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, cm)) as u32 as u64;
+        let chi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, cm)) as u32 as u64;
+        let nlo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, nl)) as u32 as u64;
+        let nhi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, nl)) as u32 as u64;
+        let nlm = nlo | (nhi << 32);
+        let sep = clo | (chi << 32) | nlm;
         let qlo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, qt)) as u32 as u64;
         let qhi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, qt)) as u32 as u64;
-        (sep, qlo | (qhi << 32))
+        (sep, qlo | (qhi << 32), nlm)
     }
 }
 
 #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
 #[inline(always)]
-unsafe fn masks64(p: *const u8) -> (u64, u64) {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     let mut sep = 0u64;
     let mut quo = 0u64;
+    let mut nl = 0u64;
     for i in 0..64 {
         let c = unsafe { *p.add(i) };
         sep |= ((c == b',' || c == b'\n') as u64) << i;
         quo |= ((c == b'"') as u64) << i;
+        nl |= ((c == b'\n') as u64) << i;
     }
-    (sep, quo)
+    (sep, quo, nl)
 }
 
 /// Portable reference for `masks64` (used by tests to check the SIMD versions).
 #[allow(dead_code)]
-pub fn masks64_ref(b: &[u8; 64]) -> (u64, u64) {
+pub fn masks64_ref(b: &[u8; 64]) -> (u64, u64, u64) {
     let mut sep = 0u64;
     let mut quo = 0u64;
+    let mut nl = 0u64;
     for i in 0..64 {
         let c = b[i];
         sep |= ((c == b',' || c == b'\n') as u64) << i;
         quo |= ((c == b'"') as u64) << i;
+        nl |= ((c == b'\n') as u64) << i;
     }
-    (sep, quo)
+    (sep, quo, nl)
 }
 
 #[allow(dead_code)]
-pub fn masks64_simd(b: &[u8; 64]) -> (u64, u64) {
+pub fn masks64_simd(b: &[u8; 64]) -> (u64, u64, u64) {
     unsafe { masks64(b.as_ptr()) }
 }
 
@@ -212,12 +223,13 @@ struct Scan<'a> {
     base: usize, // start of the current block (== len once exhausted)
     sep: u64,    // separator bits of the current block not yet popped
     qblk: u64,   // quote bits of the whole current block
+    nl: u64,     // newline bits of the whole current block
     qbefore: u32, // quotes in all blocks before `base`
 }
 
 #[cold]
 #[inline(never)]
-fn tail_masks(rest: &[u8]) -> (u64, u64) {
+fn tail_masks(rest: &[u8]) -> (u64, u64, u64) {
     let mut t = [0u8; 64];
     t[..rest.len()].copy_from_slice(rest);
     unsafe { masks64(t.as_ptr()) }
@@ -226,7 +238,7 @@ fn tail_masks(rest: &[u8]) -> (u64, u64) {
 impl<'a> Scan<'a> {
     #[inline(always)]
     fn new(d: &'a [u8]) -> Scan<'a> {
-        let mut s = Scan { d, base: 0, sep: 0, qblk: 0, qbefore: 0 };
+        let mut s = Scan { d, base: 0, sep: 0, qblk: 0, nl: 0, qbefore: 0 };
         s.load();
         s
     }
@@ -234,30 +246,32 @@ impl<'a> Scan<'a> {
     #[inline(always)]
     fn load(&mut self) {
         let len = self.d.len();
-        let (sep, quo) = if self.base + 64 <= len {
+        let (sep, quo, nl) = if self.base + 64 <= len {
             unsafe { masks64(self.d.as_ptr().add(self.base)) }
         } else {
             tail_masks(&self.d[self.base..])
         };
         self.sep = sep;
         self.qblk = quo;
+        self.nl = nl;
     }
 
-    /// Next separator position, or `len` (a virtual line end) once the data is exhausted.
+    /// Next separator position and whether it ends a line, or (`len`, true) (a virtual
+    /// line end) once the data is exhausted.
     #[inline(always)]
-    fn next(&mut self) -> usize {
+    fn next(&mut self) -> (usize, bool) {
         loop {
             if self.sep != 0 {
                 let tz = self.sep.trailing_zeros() as usize;
                 self.sep &= self.sep - 1;
-                return self.base + tz;
+                return (self.base + tz, (self.nl >> tz) & 1 != 0);
             }
             self.qbefore = self.qbefore.wrapping_add(self.qblk.count_ones());
             let len = self.d.len();
             if self.base + 64 >= len {
                 self.base = len;
                 self.qblk = 0;
-                return len;
+                return (len, true);
             }
             self.base += 64;
             self.load();
@@ -290,8 +304,8 @@ pub fn for_rows<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f
         let mut ends = [0usize; N];
         let mut k = 0usize;
         let p = loop {
-            let p = sc.next();
-            if p >= len || unsafe { *ptr.add(p) } == b'\n' {
+            let (p, eol) = sc.next();
+            if eol {
                 if k == N - 1 {
                     ends[k] = p;
                     k = N;
