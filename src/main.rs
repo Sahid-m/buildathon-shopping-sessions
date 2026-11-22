@@ -527,8 +527,9 @@ fn main() {
             }
             // Pack into 16B/slot (hash_nz, root_str) table for fast L3-friendly lookups
             log(&t0, "  links unions (t0)");
-            // Load factor 1/4..1/2 over the distinct linked ids.
-            let cap = (idmap.len * 2 + 64).next_power_of_two().max(1024).min(pmap_cap);
+            // Keep the sparse table (load about 1/4 here): sizing it by distinct ids
+            // (load up to 1/2) made the events-B lookups slower at 60M.
+            let cap = pmap_cap;
             let mask = cap - 1;
             let shift = 64 - cap.trailing_zeros();
             pmap_ptr.resize(cap, (0, 0));
