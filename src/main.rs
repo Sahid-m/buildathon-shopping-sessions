@@ -480,7 +480,7 @@ fn main() {
     log(&t0, "clicks");
 
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
-    let ev_a: Vec<Vec<Vec<EvA>>> = ev_a.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let ev_a = split_parts(ev_a);
     let ev_b: Vec<Mutex<Vec<Vec<EvB>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
@@ -499,7 +499,8 @@ fn main() {
                     if p >= NP {
                         break;
                     }
-                    let n: usize = ev_a_ref.iter().map(|v| v[p].len()).sum();
+                    let parts = take_part(ev_a_ref, p);
+                    let n: usize = parts.iter().map(|v| v.len()).sum();
                     if n == 0 {
                         continue;
                     }
@@ -514,8 +515,8 @@ fn main() {
                         best.reserve(n - best.capacity());
                     }
 
-                    for tv in ev_a_ref {
-                        for r in &tv[p] {
+                    for tv in &parts {
+                        for r in tv {
                             let h = r.ehash;
                             let tag = (h as u32) | 1;
                             let mut i = (h >> 16) as usize & mask;
@@ -562,8 +563,8 @@ fn main() {
     log(&t0, "events B");
 
     // ---- resolve persons: per user-hash bucket, probing only that bucket's pmap region ----
-    let ev_b: Vec<Vec<Vec<EvB>>> = ev_b.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let cl_b: Vec<Vec<Vec<ClB>>> = cl_b.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let ev_b = split_parts(ev_b);
+    let cl_b = split_parts(cl_b);
     let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
@@ -573,8 +574,8 @@ fn main() {
     par_for(nt, NP, |t, q| {
         {
             let mut g = ev_c[t].lock().unwrap();
-            for tv in &ev_b {
-                for r in &tv[q] {
+            for tv in take_part(&ev_b, q) {
+                for r in &tv {
                     let (pkey, name) = person_of(r.uh, r.user);
                     let price = (r.dtp >> 40) as u32;
                     g[(pkey >> 56) as usize].push(EvC {
@@ -589,8 +590,8 @@ fn main() {
             }
         }
         let mut g = cl_c[t].lock().unwrap();
-        for tv in &cl_b {
-            for r in &tv[q] {
+        for tv in take_part(&cl_b, q) {
+            for r in &tv {
                 let (pkey, _) = person_of(r.uh, Str(0));
                 g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
             }
@@ -602,8 +603,8 @@ fn main() {
     log(&t0, "persons");
 
     // ---- phase C: sessions + attribution ----
-    let ev_c: Vec<Vec<Vec<EvC>>> = ev_c.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let cl_c: Vec<Vec<Vec<ClC>>> = cl_c.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let ev_c = split_parts(ev_c);
+    let cl_c = split_parts(cl_c);
     let ncat = cat_names.len();
     struct TOut {
         ud: Vec<UdRow>,
@@ -783,19 +784,32 @@ fn main() {
     log(&t0, "done");
 }
 
+/// Per-thread, per-partition buffers; each partition is taken (and freed) by its one consumer.
+type Parts<T> = Vec<Vec<Mutex<Vec<T>>>>;
+
+fn split_parts<T>(v: Vec<Mutex<Vec<Vec<T>>>>) -> Parts<T> {
+    v.into_iter().map(|m| m.into_inner().unwrap().into_iter().map(Mutex::new).collect()).collect()
+}
+
+/// Takes partition `p` out of every thread's buffers, so it is freed once consumed.
+fn take_part<T>(parts: &Parts<T>, p: usize) -> Vec<Vec<T>> {
+    parts.iter().map(|w| std::mem::take(&mut *w[p].lock().unwrap())).collect()
+}
+
 /// Gathers partition `p` from every thread's output and sorts it. The partition already
 /// shares the top 8 key bits, so a counting pass on the next 12 bits leaves buckets of
 /// about one person each, which sort with a few insertion-sort steps.
 fn bucket_sort<T: Copy>(
-    workers: &[Vec<Vec<T>>],
+    parts: &Parts<T>,
     p: usize,
     key: impl Fn(&T) -> u64,
     cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Copy,
 ) -> Vec<T> {
     let bucket = |v: &T| ((key(v) >> 44) & 4095) as usize;
+    let workers = take_part(parts, p);
     let mut ends = vec![0usize; 4096];
-    for w in workers {
-        for v in &w[p] {
+    for w in &workers {
+        for v in w {
             ends[bucket(v)] += 1;
         }
     }
@@ -807,8 +821,8 @@ fn bucket_sort<T: Copy>(
     }
     let mut out: Vec<T> = Vec::with_capacity(n);
     let dst = out.as_mut_ptr();
-    for w in workers {
-        for v in &w[p] {
+    for w in &workers {
+        for v in w {
             let o = &mut ends[bucket(v)];
             // Prefix sums give each bucket a disjoint range with one slot per input.
             unsafe { dst.add(*o).write(*v) };
