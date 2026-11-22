@@ -1042,7 +1042,11 @@ fn process_ev_chunk(
         }
         let p = (ehash >> 56) as usize;
         let uh = hash64(key128(f[1]));
-        g[p].push(EvA {
+        let v = unsafe { g.get_unchecked_mut(p) };
+        // Pull the next output line of this partition in ahead of its write (256 streams
+        // defeat the hardware prefetcher, so each new line would otherwise stall a store).
+        csv::prefetch(v.as_ptr().wrapping_add(v.len() + 3) as *const u8);
+        v.push(EvA {
             ehash,
             uh,
             ingest_cat: ing_u | ((cat as u64) << 52),
