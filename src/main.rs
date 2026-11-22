@@ -370,6 +370,7 @@ fn main() {
     let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
     let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
     let total_edges: usize = ln_out.iter().map(|m| m.lock().unwrap().len()).sum();
+    let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(1024);
     let pm_cell: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
 
     // Payload locations name one of 2*nt worker lists: t (resolved) or nt + t (unresolved).
@@ -397,7 +398,7 @@ fn main() {
             let (ln_out, pm_cell) = (&ln_out, &pm_cell);
             s.spawn(move || {
                 if t == 0 {
-                    let _ = pm_cell.set(build_pmap(ln_out, total_edges));
+                    let _ = pm_cell.set(build_pmap(ln_out, total_edges, pmap_cap));
                     log(&t0, "  pmap built");
                 }
                 let mut ge = ev_c[t].lock().unwrap();
@@ -1155,7 +1156,7 @@ fn parse_event(f: &[&[u8]; 7], products: &KeyMap, ws: i64, we: i64, unknown_cat:
 }
 
 /// Union-find over all link edges, packed into a 16B/slot (hash_nz, root_str) table.
-fn build_pmap(ln_out: &[Mutex<Vec<(Key, Str, Key, Str)>>], total_edges: usize) -> Vec<(u64, u64)> {
+fn build_pmap(ln_out: &[Mutex<Vec<(Key, Str, Key, Str)>>], total_edges: usize, cap: usize) -> Vec<(u64, u64)> {
     let mut idmap = KeyMap::with_capacity(total_edges * 2 + 64);
     let mut ids: Vec<Str> = Vec::with_capacity(total_edges * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(total_edges * 2);
@@ -1214,8 +1215,6 @@ fn build_pmap(ln_out: &[Mutex<Vec<(Key, Str, Key, Str)>>], total_edges: usize) -
         let r = find(&mut parent, i as u32) as usize;
         root.push(unsafe { ids.get_unchecked(r).0 });
     }
-    // Load factor 1/3..2/3: a smaller table keeps lookups closer to cache.
-    let cap = (n + n / 2 + 64).next_power_of_two().max(1024);
     let mask = cap - 1;
     let shift = 64 - cap.trailing_zeros();
     let mut pmap = vec![(0u64, 0u64); cap];
