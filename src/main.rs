@@ -123,9 +123,23 @@ impl EvC {
 #[repr(C)]
 struct ClC {
     pkey: u64, // 8B
-    ts: i64,   // 8B
     cid: Str,  // 8B
-    camp: u16, // 2B + 6B pad -> 32B total
+    w: u64,    // 8B: low 32b = ts - (window_start - 7 days), high bits = campaign
+}
+
+impl ClC {
+    #[inline(always)]
+    fn new(pkey: u64, cid: Str, dt: u64, camp: u16) -> ClC {
+        ClC { pkey, cid, w: dt | ((camp as u64) << 32) }
+    }
+    #[inline(always)]
+    fn dt(&self) -> i64 {
+        (self.w & 0xFFFF_FFFF) as i64
+    }
+    #[inline(always)]
+    fn camp(&self) -> u16 {
+        (self.w >> 32) as u16
+    }
 }
 
 pub struct UdRow {
@@ -547,7 +561,7 @@ fn main() {
             }
             let r = &tmp[i];
             let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
+            g[(pkey >> 56) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
         }
     });
     drop(cl_tmp);
@@ -667,10 +681,10 @@ fn main() {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc);
         let evs = &esc.out;
-        bucket_sort(&cl_c, p, |c| c.pkey, |c| (c.ts - cws) as u64, tb, |a, b| {
+        bucket_sort(&cl_c, p, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
-                .then_with(|| a.ts.cmp(&b.ts))
+                .then_with(|| a.dt().cmp(&b.dt()))
                 .then_with(|| a.cid.get().cmp(b.cid.get()))
         }, csc);
         let cls = &mut csc.out;
@@ -679,7 +693,7 @@ fn main() {
         let mut a = 0;
         while a < cls.len() {
             let mut z = a + 1;
-            while z < cls.len() && cls[z].pkey == cls[a].pkey && cls[z].ts == cls[a].ts {
+            while z < cls.len() && cls[z].pkey == cls[a].pkey && cls[z].dt() == cls[a].dt() {
                 z += 1;
             }
             if z - a > 1 {
@@ -687,7 +701,7 @@ fn main() {
             }
             a = z;
         }
-        cls.dedup_by(|a, b| a.pkey == b.pkey && a.ts == b.ts && a.cid.get() == b.cid.get());
+        cls.dedup_by(|a, b| a.pkey == b.pkey && a.dt() == b.dt() && a.cid.get() == b.cid.get());
 
         let mut g = touts[t].lock().unwrap();
         let TOut { ud, camp } = &mut *g;
@@ -749,8 +763,8 @@ fn main() {
                 row.events += nev;
                 row.revenue += rev;
                 // attribution
-                while hi < pc.len() && pc[hi].ts <= start {
-                    let c = pc[hi].camp as usize;
+                while hi < pc.len() && (cws + pc[hi].dt()) <= start {
+                    let c = pc[hi].camp() as usize;
                     if cnt[c] == 0 {
                         pos[c] = active.len() as u32;
                         active.push(c as u16);
@@ -758,8 +772,8 @@ fn main() {
                     cnt[c] += 1;
                     hi += 1;
                 }
-                while lo < hi && pc[lo].ts < start - WEEK {
-                    let c = pc[lo].camp as usize;
+                while lo < hi && (cws + pc[lo].dt()) < start - WEEK {
+                    let c = pc[lo].camp() as usize;
                     cnt[c] -= 1;
                     if cnt[c] == 0 {
                         let p = pos[c] as usize;
@@ -771,10 +785,10 @@ fn main() {
                     lo += 1;
                 }
                 let credited = if hi > lo {
-                    let mt = pc[hi - 1].ts;
+                    let mt = cws + pc[hi - 1].dt();
                     let mut b = hi - 1;
                     let mut q = hi - 1;
-                    while q > lo && pc[q - 1].ts == mt {
+                    while q > lo && (cws + pc[q - 1].dt()) == mt {
                         q -= 1;
                         if pc[q].cid.get() < pc[b].cid.get() {
                             b = q;
@@ -783,7 +797,7 @@ fn main() {
                     for &c in &active {
                         camp[c as usize * ndays + di][3] += 1;
                     }
-                    pc[b].camp as usize
+                    pc[b].camp() as usize
                 } else {
                     ncamp
                 };
@@ -798,7 +812,7 @@ fn main() {
                 ud.push(row);
             }
             for q in lo..hi {
-                cnt[pc[q].camp as usize] = 0;
+                cnt[pc[q].camp() as usize] = 0;
             }
             active.clear();
             i = j;
