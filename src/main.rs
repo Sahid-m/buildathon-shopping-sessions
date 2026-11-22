@@ -473,16 +473,31 @@ fn main() {
             let mut idmap = KeyMap::with_capacity(total_edges * 7 / 5 + 64);
             let mut hs: Vec<u64> = Vec::with_capacity(total_edges * 2);
             let mut ids: Vec<Str> = Vec::with_capacity(total_edges * 2);
-            let mut parent: Vec<u32> = Vec::with_capacity(total_edges * 2);
+            // Union-find node: parent plus the id's first 8 bytes (big-endian, zero-padded),
+            // so the root comparison usually needs no access to the id string itself.
+            #[derive(Clone, Copy)]
+            #[repr(C)]
+            struct Node {
+                pfx: u64,
+                parent: u32,
+            }
+            let mut parent: Vec<Node> = Vec::with_capacity(total_edges * 2);
             #[inline(always)]
-            fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            fn prefix8(b: &[u8]) -> u64 {
+                let mut w = [0u8; 8];
+                let n = b.len().min(8);
+                w[..n].copy_from_slice(&b[..n]);
+                u64::from_be_bytes(w)
+            }
+            #[inline(always)]
+            fn find(parent: &mut [Node], mut x: u32) -> u32 {
                 let mut r = x;
-                while unsafe { *parent.get_unchecked(r as usize) } != r {
-                    r = unsafe { *parent.get_unchecked(r as usize) };
+                while unsafe { parent.get_unchecked(r as usize).parent } != r {
+                    r = unsafe { parent.get_unchecked(r as usize).parent };
                 }
-                while unsafe { *parent.get_unchecked(x as usize) } != r {
-                    let n = unsafe { *parent.get_unchecked(x as usize) };
-                    unsafe { *parent.get_unchecked_mut(x as usize) = r };
+                while unsafe { parent.get_unchecked(x as usize).parent } != r {
+                    let n = unsafe { parent.get_unchecked(x as usize).parent };
+                    unsafe { parent.get_unchecked_mut(x as usize).parent = r };
                     x = n;
                 }
                 r
@@ -504,7 +519,7 @@ fn main() {
                     if !pres_a {
                         ids.push(sa);
                         hs.push(ha);
-                        parent.push(ia as u32);
+                        parent.push(Node { pfx: prefix8(sa.get()), parent: ia as u32 });
                     }
                     let next_b = ids.len() as u64;
                     let hb = hash64(kb);
@@ -512,15 +527,19 @@ fn main() {
                     if !pres_b {
                         ids.push(sb);
                         hs.push(hb);
-                        parent.push(ib as u32);
+                        parent.push(Node { pfx: prefix8(sb.get()), parent: ib as u32 });
                     }
                     let ra = find(&mut parent, ia as u32);
                     let rb = find(&mut parent, ib as u32);
                     if ra != rb {
-                        if ids[ra as usize].get() < ids[rb as usize].get() {
-                            parent[rb as usize] = ra;
+                        let (pa, pb) = (parent[ra as usize].pfx, parent[rb as usize].pfx);
+                        // Differing zero-padded prefixes order the ids exactly; on a tie
+                        // compare the full strings.
+                        let a_first = if pa != pb { pa < pb } else { ids[ra as usize].get() < ids[rb as usize].get() };
+                        if a_first {
+                            parent[rb as usize].parent = ra;
                         } else {
-                            parent[ra as usize] = rb;
+                            parent[ra as usize].parent = rb;
                         }
                     }
                 }
