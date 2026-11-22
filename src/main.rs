@@ -380,8 +380,21 @@ fn main() {
     let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(1024);
     let mut pmap: Vec<(u64, u64)> = Vec::new();
 
+    // Click chunks share the events-A work queue (after the event chunks); their person
+    // lookups happen in events B, once the person map exists.
+    let cl_chunks = chunks(&cl_maps, CH);
+    let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
+    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
+    let cl_b: Vec<Mutex<Vec<ClB>>> =
+        (0..nt).map(|_| Mutex::new(Vec::with_capacity(total_cl_bytes / 50 / nt.max(1) + 64))).collect();
+    let n_ev_chunks = ev_chunks.len();
+    let n_work = n_ev_chunks + cl_chunks.len();
     let next_ev = AtomicUsize::new(0);
     std::thread::scope(|s| {
+        let cl_b_ref = &cl_b;
+        let cl_chunks_ref = &cl_chunks;
+        let cl_maps_ref = &cl_maps;
+        let campaigns_ref = &campaigns;
         let ln_out_ref = &ln_out;
         let pmap_ptr = &mut pmap;
         let ev_a_ref = &ev_a;
@@ -457,11 +470,16 @@ fn main() {
 
             // Help process remaining event chunks
             let mut g = ev_a_ref[0].lock().unwrap();
-                let mut st = wc::Stager::<EvA, 8>::new(NP);
+            let mut clb = cl_b_ref[0].lock().unwrap();
+            let mut st = wc::Stager::<EvA, 8>::new(NP);
             loop {
                 let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
-                if ci >= ev_chunks_ref.len() {
+                if ci >= n_work {
                     break;
+                }
+                if ci >= n_ev_chunks {
+                    process_cl_chunk(ci - n_ev_chunks, cl_chunks_ref, cl_maps_ref, campaigns_ref, cws, we, &mut clb);
+                    continue;
                 }
                 process_ev_chunk(
                     ci,
@@ -481,11 +499,16 @@ fn main() {
         for t in 1..nt {
             s.spawn(move || {
                 let mut g = ev_a_ref[t].lock().unwrap();
+                let mut clb = cl_b_ref[t].lock().unwrap();
                 let mut st = wc::Stager::<EvA, 8>::new(NP);
                 loop {
                     let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
-                    if ci >= ev_chunks_ref.len() {
+                    if ci >= n_work {
                         break;
+                    }
+                    if ci >= n_ev_chunks {
+                        process_cl_chunk(ci - n_ev_chunks, cl_chunks_ref, cl_maps_ref, campaigns_ref, cws, we, &mut clb);
+                        continue;
                     }
                     process_ev_chunk(
                         ci,
@@ -504,7 +527,7 @@ fn main() {
         }
     });
     drop(ln_out);
-    log(&t0, "links + events A");
+    log(&t0, "links + events A + clicks parse");
 
     let pmask = pmap.len() - 1;
     let pshift = 64 - pmap.len().trailing_zeros();
@@ -529,43 +552,9 @@ fn main() {
     let prefetch_person =
         |h: u64| csv::prefetch(unsafe { pmap.as_ptr().add(((h | 1) >> pshift) as usize) } as *const u8);
 
-    // ---- clicks ----
-    let cl_chunks = chunks(&cl_maps, CH);
-    let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
-    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
     let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
         .collect();
-    let cl_tmp: Vec<Mutex<Vec<ClB>>> = (0..nt).map(|_| Mutex::new(Vec::new())).collect();
-    par_for(nt, cl_chunks.len(), |t, ci| {
-        let (fi, s, e) = cl_chunks[ci];
-        let d: &[u8] = &cl_maps[fi][s..e];
-        let mut tmp = cl_tmp[t].lock().unwrap();
-        tmp.clear();
-        csv::for_rows::<4, _>(d, |f| {
-            if f[0].is_empty() || f[1].is_empty() {
-                return;
-            }
-            let Some(t) = ts::parse_ts(f[3]) else { return };
-            if t < cws || t >= we {
-                return;
-            }
-            let Some(camp) = campaigns.get(key128(f[2])) else { return };
-            let uh = hash64(key128(f[1]));
-            tmp.push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
-        });
-        let mut g = cl_c[t].lock().unwrap();
-        for i in 0..tmp.len() {
-            if i + PF < tmp.len() {
-                prefetch_person(tmp[i + PF].uh);
-            }
-            let r = &tmp[i];
-            let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> 56) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
-        }
-    });
-    drop(cl_tmp);
-    log(&t0, "clicks");
 
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
     let ev_a = split_parts(ev_a);
@@ -576,6 +565,8 @@ fn main() {
     std::thread::scope(|s| {
         let ev_a_ref = &ev_a;
         let ev_c_ref = &ev_c;
+        let cl_c_ref = &cl_c;
+        let cl_b_ref = &cl_b;
         let next_p_ref = &next_p;
         let person_of = &person_of;
         let prefetch_person = &prefetch_person;
@@ -586,10 +577,25 @@ fn main() {
                 let mut g = ev_c_ref[t].lock().unwrap();
                 let mut st = wc::Stager::<EvC, 8>::new(NP);
                 loop {
-                    let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
-                    if p >= NP {
+                    let item = next_p_ref.fetch_add(1, Ordering::Relaxed);
+                    if item >= nt + NP {
                         break;
                     }
+                    if item < nt {
+                        // One parse thread's clicks: resolve persons, scatter by person.
+                        let tmp = std::mem::take(&mut *cl_b_ref[item].lock().unwrap());
+                        let mut gc = cl_c_ref[t].lock().unwrap();
+                        for i in 0..tmp.len() {
+                            if i + PF < tmp.len() {
+                                prefetch_person(tmp[i + PF].uh);
+                            }
+                            let r = &tmp[i];
+                            let (pkey, _) = person_of(r.uh, Str(0));
+                            gc[(pkey >> 56) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
+                        }
+                        continue;
+                    }
+                    let p = item - nt;
                     let parts = take_part(ev_a_ref, p);
                     let n: usize = parts.iter().map(|v| v.len()).sum();
                     if n == 0 {
@@ -889,6 +895,32 @@ fn split_parts<T>(v: Vec<Mutex<Vec<Vec<T>>>>) -> Parts<T> {
 /// Takes partition `p` out of every thread's buffers, so it is freed once consumed.
 fn take_part<T>(parts: &Parts<T>, p: usize) -> Vec<Vec<T>> {
     parts.iter().map(|w| std::mem::take(&mut *w[p].lock().unwrap())).collect()
+}
+
+#[inline(always)]
+fn process_cl_chunk(
+    ci: usize,
+    cl_chunks: &[(usize, usize, usize)],
+    cl_maps: &[Mmap],
+    campaigns: &KeyMap,
+    cws: i64,
+    we: i64,
+    out: &mut Vec<ClB>,
+) {
+    let (fi, s, e) = cl_chunks[ci];
+    let d: &[u8] = &cl_maps[fi][s..e];
+    csv::for_rows::<4, _>(d, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
+        }
+        let Some(t) = ts::parse_ts(f[3]) else { return };
+        if t < cws || t >= we {
+            return;
+        }
+        let Some(camp) = campaigns.get(key128(f[2])) else { return };
+        let uh = hash64(key128(f[1]));
+        out.push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
+    });
 }
 
 /// Gathers partition `p` from every thread's output and sorts it by (pkey, ts). The partition
