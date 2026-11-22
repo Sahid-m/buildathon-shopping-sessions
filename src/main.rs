@@ -1060,7 +1060,7 @@ fn sort_bucket<T: Copy>(
     true
 }
 
-const BATCH: usize = 16;
+const BATCH: usize = 32;
 
 /// Lookups in the person table: (hash | 1, root id string) slots, indexed by the top bits.
 struct PLook<'a> {
