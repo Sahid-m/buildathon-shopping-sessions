@@ -144,7 +144,20 @@ unsafe fn masks64(p: *const u8) -> (u64, u64) {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_loadu_si512(p as *const _);
+        let sep = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8))
+            | _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        let quo = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+        (sep, quo)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64) {
     use core::arch::x86_64::*;
