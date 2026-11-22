@@ -3,11 +3,10 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "40064f6:x86-64-v3 th3r0n:native"
+  VARIANTS: "40064f6:x86-64-v3 652609e:x86-64-v3 40064f6:x86-64-v3:SS_NPCBITS=8 652609e:x86-64-v3:SS_NPCBITS=8 652609e:x86-64-v3:SS_NOTUNE=1 652609e:x86-64-v3:SS_POPW=0"
 on:
   push:
-    branches: [bench]
-    paths: ['.github/workflows/bench.yml']
+    branches: [memport-bench]
   workflow_dispatch:
     inputs:
       shas:
