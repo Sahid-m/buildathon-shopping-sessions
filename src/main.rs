@@ -833,12 +833,12 @@ fn main() {
         while i < evs.len() {
             let pk = evs[i].pkey;
             let pf_end = (i + NAME_PF).min(evs.len());
+            // Every event is prefetched (no branch on person boundaries to mispredict); repeats
+            // of a person's name hit L1.
             while pf < pf_end {
-                if pf == 0 || evs[pf].pkey != evs[pf - 1].pkey {
-                    let nm = evs[pf].name.get();
-                    csv::prefetch(nm.as_ptr());
-                    csv::prefetch(nm.as_ptr().wrapping_add(nm.len().saturating_sub(1)));
-                }
+                let nm = evs[pf].name.get();
+                csv::prefetch(nm.as_ptr());
+                csv::prefetch(nm.as_ptr().wrapping_add(nm.len().saturating_sub(1)));
                 pf += 1;
             }
             let mut j = i;
