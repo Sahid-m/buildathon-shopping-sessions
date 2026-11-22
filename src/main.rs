@@ -786,20 +786,36 @@ fn main() {
         }, csc, pool);
         let cls = &mut csc.scat;
         tt = Instant::now();
-        // The packed sort keeps equal (pkey, ts) clicks in input order; order those runs by
-        // click_id so the dedup below sees copies side by side.
-        let mut a = 0;
-        while a < cls.len() {
+        // The packed sort keeps equal (pkey, ts) clicks in input order. Compact in one pass:
+        // a click unequal in (pkey, ts) to the next is kept as is (the common, well-predicted
+        // case; the test uses `&` so pkey equality is not a branch of its own); a run of equal
+        // (pkey, ts) is ordered by click_id and copies of one click_id are dropped.
+        let n = cls.len();
+        let mut w = 0usize;
+        let mut a = 0usize;
+        while a < n {
+            let x = cls[a];
+            let tie = a + 1 < n && ((cls[a + 1].pkey == x.pkey) & (cls[a + 1].w as u32 == x.w as u32));
+            if !tie {
+                cls[w] = x;
+                w += 1;
+                a += 1;
+                continue;
+            }
             let mut z = a + 1;
-            while z < cls.len() && cls[z].pkey == cls[a].pkey && cls[z].dt() == cls[a].dt() {
+            while z < n && cls[z].pkey == x.pkey && cls[z].dt() == x.dt() {
                 z += 1;
             }
-            if z - a > 1 {
-                cls[a..z].sort_unstable_by(|x, y| x.cid.get().cmp(y.cid.get()));
+            cls[a..z].sort_unstable_by(|x, y| x.cid.get().cmp(y.cid.get()));
+            for q in a..z {
+                if q == a || cls[q].cid.get() != cls[q - 1].cid.get() {
+                    cls[w] = cls[q];
+                    w += 1;
+                }
             }
             a = z;
         }
-        cls.dedup_by(|a, b| a.pkey == b.pkey && a.dt() == b.dt() && a.cid.get() == b.cid.get());
+        cls.truncate(w);
         ph(4, &mut tt);
 
         let mut g = touts[t].lock().unwrap();
