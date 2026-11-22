@@ -185,3 +185,54 @@ fn ingest_fast_path() {
     }
     assert!(n > 500_000);
 }
+
+/// The direct `c_<n>` campaign table must agree with an exact string lookup: a string
+/// resolves iff it equals a campaign name byte for byte.
+#[test]
+fn campaign_direct_lookup() {
+    let mut r = Rng(0x1234_5678_9abc_def1);
+    let alpha = b"c_C0123456789x\"";
+    let mk = |r: &mut Rng| -> Vec<u8> {
+        let n = r.below(9) as usize;
+        let mut v: Vec<u8> = (0..n).map(|_| alpha[r.below(alpha.len() as u64) as usize]).collect();
+        if r.below(2) == 0 && n >= 2 {
+            v[0] = b'c';
+            v[1] = b'_';
+        }
+        v
+    };
+    for _ in 0..200 {
+        let mut names: Vec<Vec<u8>> = (0..r.below(60)).map(|_| mk(&mut r)).collect();
+        for k in 0..r.below(40) {
+            names.push(format!("c_{}", r.below(70000) + k).into_bytes());
+        }
+        names.push(b"c_0".to_vec());
+        names.sort();
+        names.dedup();
+        let mut direct = vec![0u16; 1 << 16];
+        for (i, nm) in names.iter().enumerate() {
+            if let Some(v) = crate::canon_c(nm) {
+                direct[v] = (i + 1) as u16;
+            }
+        }
+        for _ in 0..2000 {
+            let q = if r.below(3) == 0 { names[r.below(names.len() as u64) as usize].clone() } else if r.below(2) == 0 {
+                format!("c_{}", r.below(70000)).into_bytes()
+            } else {
+                mk(&mut r)
+            };
+            let exact = names.iter().position(|n| *n == q);
+            let got = match crate::canon_c(&q) {
+                Some(v) => if direct[v] == 0 { None } else { Some(direct[v] as usize - 1) },
+                None => exact, // map path is exact by construction
+            };
+            assert_eq!(got, exact, "{:?}", String::from_utf8_lossy(&q));
+        }
+    }
+    for s in [&b"c_00"[..], b"c_01", b"c_", b"c_65536", b"c_1a", b"C_1", b"c_-1"] {
+        assert!(crate::canon_c(s).is_none() || s == b"c_65536", "{:?}", s);
+    }
+    assert_eq!(crate::canon_c(b"c_65536"), None);
+    assert_eq!(crate::canon_c(b"c_65535"), Some(65535));
+    assert_eq!(crate::canon_c(b"c_0"), Some(0));
+}
