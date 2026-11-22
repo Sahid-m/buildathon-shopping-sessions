@@ -160,6 +160,24 @@ pub struct UdRow {
     pub top: Option<u16>,
 }
 
+/// `c_<n>` with n in canonical decimal (no leading zeros) and n < 65536.
+#[inline(always)]
+fn canon_c(b: &[u8]) -> Option<usize> {
+    let n = b.len();
+    if !(3..=7).contains(&n) || b[0] != b'c' || b[1] != b'_' || (b[2] == b'0' && n > 3) {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in &b[2..] {
+        let x = c.wrapping_sub(b'0');
+        if x > 9 {
+            return None;
+        }
+        v = v * 10 + x as usize;
+    }
+    if v < 65536 { Some(v) } else { None }
+}
+
 fn log(t0: &Instant, msg: &str) {
     if std::env::var_os("SS_QUIET").is_none() {
         eprintln!("[{:8.3} ms] {}", t0.elapsed().as_secs_f64() * 1000.0, msg);
@@ -370,6 +388,25 @@ fn main() {
         }
     }
     let ncamp = camp_names.len();
+    // Campaign ids of the form `c_<n>` (canonical decimal, n < 2^16) resolve through a
+    // direct table; any other string goes through the map. A canonical string can only
+    // equal a campaign that is itself canonical, so a direct-table miss is a true miss.
+    let mut camp_direct: Vec<u16> = vec![0; 1 << 16];
+    for (i, nm) in camp_names.iter().enumerate() {
+        if let Some(v) = canon_c(nm) {
+            camp_direct[v] = (i + 1) as u16;
+        }
+    }
+    assert!(ncamp < 65535, "too many campaigns");
+    let camp_lookup = |b: &[u8]| -> Option<u64> {
+        match canon_c(b) {
+            Some(v) => {
+                let c = unsafe { *camp_direct.get_unchecked(v) };
+                if c == 0 { None } else { Some(c as u64 - 1) }
+            }
+            None => campaigns.get(key128(b)),
+        }
+    };
     // EvC packs ts - window_start into 31 bits and the category into 9 bits.
     assert!(we - ws < (1i64 << 31), "window longer than 24 days is not supported");
     assert!(cat_names.len() <= 512, "more than 512 categories is not supported");
@@ -599,12 +636,20 @@ fn main() {
     let cl_chunks = chunks(&cl_maps, CH);
     let cl_c: Vec<Mutex<Vec<List<ClC>>>> =
         (0..nt).map(|_| Mutex::new((0..npc).map(|_| List::default()).collect())).collect();
-    let cl_tmp: Vec<Mutex<Vec<ClB>>> = (0..nt).map(|_| Mutex::new(Vec::new())).collect();
+    let cl_st: Vec<Mutex<wc::Stager<ClC, 8>>> = (0..nt).map(|_| Mutex::new(wc::Stager::new(npc))).collect();
     par_for(nt, cl_chunks.len(), |t, ci| {
         let (fi, s, e) = cl_chunks[ci];
         let d: &[u8] = &cl_maps[fi][s..e];
-        let mut tmp = cl_tmp[t].lock().unwrap();
-        tmp.clear();
+        let mut g = cl_c[t].lock().unwrap();
+        let mut st = cl_st[t].lock().unwrap();
+        // Valid clicks wait in a small ring while their pmap home slot is prefetched.
+        const RING: usize = 32;
+        let mut ring = [ClB { uh: 0, ts: 0, cid: Str(0), camp: 0 }; RING];
+        let mut n = 0usize;
+        let emit = |r: &ClB, g: &mut Vec<List<ClC>>, st: &mut wc::Stager<ClC, 8>| {
+            let (pkey, _) = person_of(r.uh, Str(0));
+            st.push(g, pool, (pkey >> pshc) as usize, ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
+        };
         csv::for_rows::<4, _>(d, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
@@ -613,21 +658,23 @@ fn main() {
             if t < cws || t >= we {
                 return;
             }
-            let Some(camp) = campaigns.get(key128(f[2])) else { return };
+            let Some(camp) = camp_lookup(f[2]) else { return };
             let uh = hash64(key128(f[1]));
-            tmp.push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
-        });
-        let mut g = cl_c[t].lock().unwrap();
-        for i in 0..tmp.len() {
-            if i + PF < tmp.len() {
-                prefetch_person(tmp[i + PF].uh);
+            prefetch_person(uh);
+            if n >= PF {
+                let r = ring[(n - PF) % RING];
+                emit(&r, &mut g, &mut st);
             }
-            let r = &tmp[i];
-            let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> pshc) as usize].push(pool, ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
+            ring[n % RING] = ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 };
+            n += 1;
+        });
+        for i in n.saturating_sub(PF)..n {
+            let r = ring[i % RING];
+            emit(&r, &mut g, &mut st);
         }
+        st.finish(&mut g, pool);
     });
-    drop(cl_tmp);
+    drop(cl_st);
     log(&t0, "clicks");
 
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
