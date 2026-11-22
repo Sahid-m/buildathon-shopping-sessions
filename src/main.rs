@@ -1085,7 +1085,7 @@ impl<T> Scratch<T> {
 }
 
 /// Buckets up to this size are insertion-sorted in place instead of via packed keys.
-const SMALL: usize = 8;
+const SMALL: usize = 16;
 
 /// How many events ahead phase C prefetches user names.
 const NAME_PF: usize = 24;
