@@ -210,7 +210,29 @@ fn small_lines(d: &[u8]) -> impl Iterator<Item = &[u8]> {
     lines.into_iter().skip(1)
 }
 
+/// The scorer's kernel only gives huge pages to memory that asks for them (THP "madvise").
+/// glibc's allocator asks when this tunable is set, which cuts page faults while the big
+/// buffers are first touched and page freeing at exit. Re-exec once with it set.
+const TUNABLES: &str = "glibc.malloc.hugetlb=1";
+
+fn ensure_tunables() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        if std::env::var("GLIBC_TUNABLES").map(|v| v.contains("hugetlb")).unwrap_or(false) {
+            return;
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let mut args = std::env::args_os();
+            args.next();
+            // exec only returns on failure; then just carry on without the tunable.
+            let _ = std::process::Command::new(exe).args(args).env("GLIBC_TUNABLES", TUNABLES).exec();
+        }
+    }
+}
+
 fn main() {
+    ensure_tunables();
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let (data, out) = if args.len() >= 3 {
