@@ -45,6 +45,7 @@ impl Str {
 #[repr(C)]
 struct EvA {
     ehash: u64,        // 8B: hash64(key128(event_id))
+    uh: u64,           // 8B: hash64(key128(user_id)), computed while the line is hot
     ingest_cat: u64,   // 8B: low 52b = biased ingest, high 12b = cat
     user: Str,         // 8B
     ts_lo: u32,        // 4B: low 32b of (ts - ws)
@@ -68,6 +69,26 @@ impl EvA {
     fn price(&self) -> u32 {
         self.price_ts_hi & 0x00FF_FFFF
     }
+}
+
+/// A deduped, valid event before person resolution, bucketed by user hash.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EvB {
+    uh: u64,
+    user: Str,
+    dtp: u64, // low 40b = ts - ws, high 24b = price
+    cat: u16,
+}
+
+/// A valid click before person resolution, bucketed by user hash.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ClB {
+    uh: u64,
+    ts: i64,
+    cid: Str,
+    camp: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -290,7 +311,7 @@ fn main() {
         .collect();
 
     let total_edges: usize = ln_out.iter().map(|m| m.lock().unwrap().len()).sum();
-    let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(16);
+    let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(1024);
     let mut pmap: Vec<(u64, u64)> = Vec::new();
 
     let next_ev = AtomicUsize::new(0);
@@ -348,15 +369,16 @@ fn main() {
                 }
             }
             // Pack into 16B/slot (hash_nz, root_str) table for fast L3-friendly lookups
-            let cap = idmap.entries.len().max(pmap_cap);
+            let cap = pmap_cap;
             let mask = cap - 1;
+            let shift = 64 - cap.trailing_zeros();
             pmap_ptr.resize(cap, (0, 0));
             for e in &idmap.entries {
                 if !e.k.is_zero() {
                     let r = find(&mut parent, e.v as u32) as usize;
                     let raw = ids[r].0;
                     let h_nz = hash64(e.k) | 1;
-                    let mut i = (h_nz as usize) & mask;
+                    let mut i = (h_nz >> shift) as usize;
                     while unsafe { pmap_ptr.get_unchecked(i).0 } != 0 {
                         i = (i + 1) & mask;
                     }
@@ -413,10 +435,10 @@ fn main() {
     log(&t0, "links + events A");
 
     let pmask = pmap.len() - 1;
-    let person_of = |user: &[u8]| -> (u64, Str) {
-        let h = hash64(key128(user));
+    let pshift = 64 - pmap.len().trailing_zeros();
+    let person_of = |h: u64, user: Str| -> (u64, Str) {
         let h_nz = h | 1;
-        let mut i = (h_nz as usize) & pmask;
+        let mut i = (h_nz >> pshift) as usize;
         loop {
             let (k, raw) = unsafe { *pmap.get_unchecked(i) };
             if k == h_nz {
@@ -424,7 +446,7 @@ fn main() {
                 return (ph, Str(raw));
             }
             if k == 0 {
-                return (h, Str::of(user));
+                return (h, user);
             }
             i = (i + 1) & pmask;
         }
@@ -434,13 +456,13 @@ fn main() {
     let cl_chunks = chunks(&cl_maps, CH);
     let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
     let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
-    let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
+    let cl_b: Vec<Mutex<Vec<Vec<ClB>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
         .collect();
     par_for(nt, cl_chunks.len(), |t, ci| {
         let (fi, s, e) = cl_chunks[ci];
         let d: &[u8] = &cl_maps[fi][s..e];
-        let mut g = cl_c[t].lock().unwrap();
+        let mut g = cl_b[t].lock().unwrap();
         csv::for_lines(d, |line| {
             let mut f: [&[u8]; 4] = [&[]; 4];
             if !csv::split::<4>(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
@@ -451,28 +473,27 @@ fn main() {
                 return;
             }
             let Some(camp) = campaigns.get(key128(f[2])) else { return };
-            let (pkey, _) = person_of(f[1]);
-            g[(pkey >> 56) as usize].push(ClC { pkey, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
+            let uh = hash64(key128(f[1]));
+            g[(uh >> 56) as usize].push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
         });
     });
     log(&t0, "clicks");
 
     // ---- events phase B: dedup with 8-byte-per-slot L2-resident table reused per thread ----
     let ev_a: Vec<Vec<Vec<EvA>>> = ev_a.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
+    let ev_b: Vec<Mutex<Vec<Vec<EvB>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
     let next_p = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let ev_a_ref = &ev_a;
-        let ev_c_ref = &ev_c;
+        let ev_b_ref = &ev_b;
         let next_p_ref = &next_p;
-        let person_of_ref = &person_of;
         for t in 0..nt {
             s.spawn(move || {
                 let mut tab: Vec<u64> = Vec::new();
                 let mut best: Vec<EvA> = Vec::new();
-                let mut g = ev_c_ref[t].lock().unwrap();
+                let mut g = ev_b_ref[t].lock().unwrap();
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
                     if p >= NP {
@@ -526,15 +547,11 @@ fn main() {
                         if dt == INVALID_DT {
                             continue;
                         }
-                        let (pkey, name) = person_of_ref(r.user.get());
-                        let price = r.price();
-                        g[(pkey >> 56) as usize].push(EvC {
-                            pkey,
-                            ts: ws + dt as i64,
-                            name,
-                            price,
+                        g[(r.uh >> 56) as usize].push(EvB {
+                            uh: r.uh,
+                            user: r.user,
+                            dtp: dt | ((r.price() as u64) << 40),
                             cat: r.cat(),
-                            purchase: price > 0,
                         });
                     }
                 }
@@ -542,8 +559,47 @@ fn main() {
         }
     });
     drop(ev_a);
-    drop(pmap);
     log(&t0, "events B");
+
+    // ---- resolve persons: per user-hash bucket, probing only that bucket's pmap region ----
+    let ev_b: Vec<Vec<Vec<EvB>>> = ev_b.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let cl_b: Vec<Vec<Vec<ClB>>> = cl_b.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let ev_c: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt)
+        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
+        .collect();
+    let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
+        .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
+        .collect();
+    par_for(nt, NP, |t, q| {
+        {
+            let mut g = ev_c[t].lock().unwrap();
+            for tv in &ev_b {
+                for r in &tv[q] {
+                    let (pkey, name) = person_of(r.uh, r.user);
+                    let price = (r.dtp >> 40) as u32;
+                    g[(pkey >> 56) as usize].push(EvC {
+                        pkey,
+                        ts: ws + (r.dtp & 0xFF_FFFF_FFFF) as i64,
+                        name,
+                        price,
+                        cat: r.cat,
+                        purchase: price > 0,
+                    });
+                }
+            }
+        }
+        let mut g = cl_c[t].lock().unwrap();
+        for tv in &cl_b {
+            for r in &tv[q] {
+                let (pkey, _) = person_of(r.uh, Str(0));
+                g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
+            }
+        }
+    });
+    drop(ev_b);
+    drop(cl_b);
+    drop(pmap);
+    log(&t0, "persons");
 
     // ---- phase C: sessions + attribution ----
     let ev_c: Vec<Vec<Vec<EvC>>> = ev_c.into_iter().map(|m| m.into_inner().unwrap()).collect();
@@ -789,8 +845,10 @@ fn process_ev_chunk(
             }
         }
         let p = (ehash >> 56) as usize;
+        let uh = hash64(key128(f[1]));
         g[p].push(EvA {
             ehash,
+            uh,
             ingest_cat: ing_u | ((cat as u64) << 52),
             user: Str::of(f[1]),
             ts_lo: dt as u32,
