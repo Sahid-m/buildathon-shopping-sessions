@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "d2e286a:x86-64-v3 eda5934:x86-64-v3 d867982:x86-64-v3"
+  VARIANTS: "d2e286a:x86-64-v3 eda5934:x86-64-v3 7c1c29d:x86-64-v3 d867982:x86-64-v3 059487d:x86-64-v3"
 on:
   push:
     branches: [evb-bench]
@@ -16,6 +16,10 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
