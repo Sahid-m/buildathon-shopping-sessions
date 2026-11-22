@@ -1042,7 +1042,7 @@ fn bucket_sort<T: Copy>(
             }
             continue;
         }
-        if !sort_bucket(b, &key, &tsoff, tb, keys, pks, out) {
+        if !sort_bucket(b, &key, &tsoff, tb, bsh, keys, pks, out) {
             let o = out.len();
             out.extend_from_slice(b);
             out[o..].sort_unstable_by(cmp);
@@ -1078,6 +1078,7 @@ fn sort_bucket<T: Copy>(
     key: &impl Fn(&T) -> u64,
     tsoff: &impl Fn(&T) -> u64,
     tb: u32,
+    bsh: u32,
     keys: &mut Vec<u64>,
     pks: &mut Vec<u64>,
     out: &mut Vec<T>,
@@ -1097,6 +1098,31 @@ fn sort_bucket<T: Copy>(
         if rb == 0 {
             return false;
         }
+        let sh = tb + ib;
+        let mask = (1u64 << ib) - 1;
+        // Bucket members share every key bit above `bsh`, so the key bits just below it order
+        // the persons as the full key does, as long as no two persons share them. Use those
+        // bits as the rank and check the sorted runs; on a clash, rank by sort + dedup below.
+        let rbits = rb.min(bsh);
+        if rbits >= 8 {
+            let lsh = bsh - rbits;
+            let rmask = (1u64 << rbits) - 1;
+            keys.extend(
+                b.iter().enumerate().map(|(i, v)| (((key(v) >> lsh) & rmask) << sh) | (tsoff(v) << ib) | i as u64),
+            );
+            keys.sort_unstable();
+            let mut ok = true;
+            for w in keys.windows(2) {
+                let same_rank = (w[0] >> sh) == (w[1] >> sh);
+                let (x, y) = unsafe { (b.get_unchecked((w[0] & mask) as usize), b.get_unchecked((w[1] & mask) as usize)) };
+                ok &= !same_rank | (key(x) == key(y));
+            }
+            if ok {
+                out.extend(keys.iter().map(|&k| unsafe { *b.get_unchecked((k & mask) as usize) }));
+                return true;
+            }
+            keys.clear();
+        }
         pks.clear();
         pks.extend(b.iter().map(key));
         pks.sort_unstable();
@@ -1104,7 +1130,6 @@ fn sort_bucket<T: Copy>(
         if rb < 64 && pks.len() as u64 > (1u64 << rb) {
             return false;
         }
-        let sh = tb + ib;
         keys.extend(b.iter().enumerate().map(|(i, v)| {
             let r = match pks.binary_search(&key(v)) {
                 Ok(r) => r as u64,
