@@ -87,12 +87,36 @@ struct ClB {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct EvC {
-    pkey: u64,      // 8B
-    ts: i64,        // 8B
-    name: Str,      // 8B
-    price: u32,     // 4B
-    cat: u16,       // 2B
-    purchase: bool, // 1B + 1B pad -> 32B total
+    pkey: u64, // 8B
+    name: Str, // 8B
+    w: u64,    // 8B: low 31b = ts - ws, next 24b = price (0 unless purchase), top 9b = category
+}
+
+impl EvC {
+    #[inline(always)]
+    fn new(pkey: u64, name: Str, dt: u64, price: u32, cat: u16) -> EvC {
+        EvC { pkey, name, w: dt | ((price as u64) << 31) | ((cat as u64) << 55) }
+    }
+    #[inline(always)]
+    fn dt(&self) -> i64 {
+        (self.w & 0x7FFF_FFFF) as i64
+    }
+    #[inline(always)]
+    fn ts(&self, ws: i64) -> i64 {
+        ws + self.dt()
+    }
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        ((self.w >> 31) & 0xFF_FFFF) as u32
+    }
+    #[inline(always)]
+    fn cat(&self) -> u16 {
+        (self.w >> 55) as u16
+    }
+    #[inline(always)]
+    fn purchase(&self) -> bool {
+        self.price() > 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -304,6 +328,9 @@ fn main() {
         }
     }
     let ncamp = camp_names.len();
+    // EvC packs ts - window_start into 31 bits and the category into 9 bits.
+    assert!(we - ws < (1i64 << 31), "window longer than 24 days is not supported");
+    assert!(cat_names.len() <= 512, "more than 512 categories is not supported");
     log(&t0, "small files");
 
     // map all big files
@@ -604,14 +631,7 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        st.push(&mut g, (pkey >> 56) as usize, EvC {
-                            pkey,
-                            ts: ws + dt as i64,
-                            name,
-                            price,
-                            cat: r.cat(),
-                            purchase: price > 0,
-                        });
+                        st.push(&mut g, (pkey >> 56) as usize, EvC::new(pkey, name, dt, price, r.cat()));
                     }
                 }
                 st.finish(&mut g);
@@ -643,8 +663,8 @@ fn main() {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
-        bucket_sort(&ev_c, p, |e| e.pkey, |e| (e.ts - cws) as u64, tb, |a, b| {
-            (a.pkey, a.ts).cmp(&(b.pkey, b.ts))
+        bucket_sort(&ev_c, p, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
+            (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc);
         let evs = &esc.out;
         bucket_sort(&cl_c, p, |c| c.pkey, |c| (c.ts - cws) as u64, tb, |a, b| {
@@ -697,7 +717,7 @@ fn main() {
             let mut cur: Option<UdRow> = None;
             let mut k = i;
             while k < j {
-                let start = evs[k].ts;
+                let start = evs[k].ts(ws);
                 let day = start.div_euclid(DAY) as i32;
                 let di = (start.div_euclid(DAY) - day0) as usize;
                 if cur.as_ref().map(|c| c.day != day).unwrap_or(false) {
@@ -709,16 +729,17 @@ fn main() {
                 let mut m = k;
                 let mut rev = 0i64;
                 let mut purchased = false;
-                while m < j && evs[m].ts - last <= GAP {
+                while m < j && evs[m].ts(ws) - last <= GAP {
                     let e = &evs[m];
-                    last = e.ts;
-                    if e.purchase {
+                    last = e.ts(ws);
+                    if e.purchase() {
+                        let (price, cat) = (e.price() as i64, e.cat());
                         purchased = true;
-                        rev += e.price as i64;
-                        if catsum[e.cat as usize] == 0 {
-                            cat_touched.push(e.cat);
+                        rev += price;
+                        if catsum[cat as usize] == 0 {
+                            cat_touched.push(cat);
                         }
-                        catsum[e.cat as usize] += e.price as i64;
+                        catsum[cat as usize] += price;
                     }
                     m += 1;
                 }
