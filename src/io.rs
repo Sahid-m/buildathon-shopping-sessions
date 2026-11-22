@@ -114,3 +114,111 @@ pub fn load_all(paths: &[PathBuf], nt: usize) -> Vec<Data> {
     });
     out
 }
+
+/// `sessions --diag DATA`: measures the machine (cold read speed, page-fault and copy cost).
+pub fn diag(data: &std::path::Path, nt: usize) {
+    use std::time::Instant;
+    let list = |d: &str| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(data.join(d))
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let ev = list("events");
+    let t = Instant::now();
+    let bufs = load_all(&ev, nt);
+    let bytes: usize = bufs.iter().map(|b| b.len()).sum();
+    let s = t.elapsed().as_secs_f64();
+    eprintln!("DIAG first parallel pread of events: {} MB in {:.3} s = {:.0} MB/s", bytes >> 20, s, bytes as f64 / s / 1e6);
+    drop(bufs);
+    let t = Instant::now();
+    let bufs = load_all(&ev, nt);
+    let s = t.elapsed().as_secs_f64();
+    eprintln!("DIAG second parallel pread: {:.3} s = {:.0} MB/s", s, bytes as f64 / s / 1e6);
+    drop(bufs);
+    let t = Instant::now();
+    let bufs = load_all(&ev, 1);
+    eprintln!("DIAG single-thread pread: {:.3} s", t.elapsed().as_secs_f64());
+    drop(bufs);
+    // mmap + touch, single thread and parallel
+    let maps: Vec<Mmap> = ev.iter().filter_map(|p| unsafe { Mmap::map(&File::open(p).ok()?).ok() }).collect();
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for m in &maps {
+        let mut i = 0;
+        while i < m.len() {
+            acc = acc.wrapping_add(m[i] as u64);
+            i += 4096;
+        }
+    }
+    eprintln!("DIAG mmap touch every page, 1 thread: {:.3} s ({} pages) acc={}", t.elapsed().as_secs_f64(), bytes / 4096, acc & 1);
+    drop(maps);
+    let maps: Vec<Mmap> = ev.iter().filter_map(|p| unsafe { Mmap::map(&File::open(p).ok()?).ok() }).collect();
+    let t = Instant::now();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| {
+                let mut acc = 0u64;
+                loop {
+                    let j = next.fetch_add(1, Ordering::Relaxed);
+                    if j >= maps.len() {
+                        break;
+                    }
+                    let m = &maps[j];
+                    let mut i = 0;
+                    while i < m.len() {
+                        acc = acc.wrapping_add(m[i] as u64);
+                        i += 4096;
+                    }
+                }
+                std::hint::black_box(acc);
+            });
+        }
+    });
+    eprintln!("DIAG mmap touch every page, {nt} threads: {:.3} s", t.elapsed().as_secs_f64());
+    drop(maps);
+    // anonymous memory faults
+    for huge in [false, true] {
+        let n = 1usize << 30;
+        let ptr = unsafe { alloc(Layout::from_size_align(n, ALIGN).unwrap()) };
+        if huge {
+            advise_huge(ptr, n);
+        }
+        let t = Instant::now();
+        let mut i = 0;
+        while i < n {
+            unsafe { std::ptr::write_volatile(ptr.add(i), 1) };
+            i += 4096;
+        }
+        let s = t.elapsed().as_secs_f64();
+        eprintln!("DIAG touch 1 GiB anon (hugepage advice {huge}), 1 thread: {:.3} s = {:.2} us/4K page", s, s * 1e6 / (n / 4096) as f64);
+        let t = Instant::now();
+        unsafe { std::ptr::write_bytes(ptr, 7, n) }; std::hint::black_box(unsafe { std::ptr::read_volatile(ptr.add(n / 2)) });
+        eprintln!("DIAG memset 1 GiB after touch: {:.3} s", t.elapsed().as_secs_f64());
+        unsafe { dealloc(ptr, Layout::from_size_align_unchecked(n, ALIGN)) };
+    }
+    // parallel anon faults
+    let t = Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| {
+                let n = 256usize << 20;
+                let ptr = unsafe { alloc(Layout::from_size_align(n, ALIGN).unwrap()) };
+                let mut i = 0;
+                while i < n {
+                    unsafe { std::ptr::write_volatile(ptr.add(i), 1) };
+                    i += 4096;
+                }
+                unsafe { dealloc(ptr, Layout::from_size_align_unchecked(n, ALIGN)) };
+            });
+        }
+    });
+    eprintln!("DIAG {nt} threads x 256 MiB anon touch: {:.3} s", t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    for _ in 0..20000 {
+        std::hint::black_box(std::fs::metadata(data.join("manifest.json")).ok());
+    }
+    eprintln!("DIAG 20000 stat syscalls: {:.3} s", t.elapsed().as_secs_f64());
+}

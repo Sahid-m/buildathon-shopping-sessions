@@ -204,6 +204,11 @@ fn small_lines(d: &[u8]) -> impl Iterator<Item = &[u8]> {
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--diag" {
+        let nt = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        io::diag(Path::new(&args[2]), nt);
+        return;
+    }
     let (data, out) = if args.len() >= 3 {
         (PathBuf::from(&args[1]), PathBuf::from(&args[2]))
     } else {

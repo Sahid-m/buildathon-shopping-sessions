@@ -9,5 +9,6 @@ RUN cargo build --release --locked
 # Run stage: minimal image, the binary only.
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/sessions /app/sessions
+COPY diag.sh /app/diag.sh
 USER 1000:1000
-CMD ["/app/sessions"]
+CMD ["/app/diag.sh"]
