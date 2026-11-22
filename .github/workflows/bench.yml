@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "129036e:x86-64-v3 72e3bd1:x86-64-v3 bc9701c:x86-64-v3"
+  VARIANTS: "129036e:x86-64-v3 bc9701c:x86-64-v3 dd505f5:x86-64-v3"
 on:
   push:
     branches: [clinks-bench]
