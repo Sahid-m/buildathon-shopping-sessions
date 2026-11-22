@@ -269,6 +269,27 @@ fn par_for<F: Fn(usize, usize) + Sync>(nt: usize, n: usize, f: F) {
     });
 }
 
+/// Like `par_for`, on exactly `nt` threads; each thread runs `fin(t)` once it finds no more
+/// work, while the others may still be running.
+fn par_for_fin<F: Fn(usize, usize) + Sync, G: Fn(usize) + Sync>(nt: usize, n: usize, f: F, fin: G) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for t in 0..nt {
+            let (f, fin, next) = (&f, &fin, &next);
+            s.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    f(t, i);
+                }
+                fin(t);
+            });
+        }
+    });
+}
+
 fn read_small(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_default()
 }
@@ -738,7 +759,11 @@ fn main() {
     let order = lpt_order(&ev_c, &cl_c, npc);
     // Phase C buckets: the 12 hash bits just below the partition bits.
     let bsh = pshc - 12;
-    par_for(nt, npc, |t, pi| {
+    let ud_dir = out.join("user_daily");
+    let cd_dir = out.join("campaign_daily");
+    std::fs::create_dir_all(&ud_dir).unwrap();
+    std::fs::create_dir_all(&cd_dir).unwrap();
+    par_for_fin(nt, npc, |t, pi| {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
@@ -894,8 +919,12 @@ fn main() {
             active.clear();
             i = j;
         }
+    }, |t| {
+        // This thread's user_daily rows are complete: write them while others finish.
+        let g = touts[t].lock().unwrap();
+        pq::write_user_daily(&ud_dir.join(format!("part-{t}.parquet")), &g.ud);
     });
-    log(&t0, "phase C");
+    log(&t0, "phase C"); // includes the user_daily writes
 
     // ---- output ----
     let touts: Vec<TOut> = touts.into_iter().map(|m| m.into_inner().unwrap()).collect();
@@ -908,15 +937,7 @@ fn main() {
             a[3] += x as i64;
         }
     }
-    let ud_dir = out.join("user_daily");
-    let cd_dir = out.join("campaign_daily");
-    std::fs::create_dir_all(&ud_dir).unwrap();
-    std::fs::create_dir_all(&cd_dir).unwrap();
-    std::thread::scope(|s| {
-        for (ti, to) in touts.iter().enumerate() {
-            let path = ud_dir.join(format!("part-{ti}.parquet"));
-            s.spawn(move || pq::write_user_daily(&path, &to.ud));
-        }
+    {
         let mut rows: Vec<pq::CdRow> = vec![];
         for c in 0..=ncamp {
             for d in 0..ndays {
@@ -937,7 +958,7 @@ fn main() {
             }
         }
         pq::write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows);
-    });
+    }
     log(&t0, "done");
     // Skip freeing the large buffers; the OS reclaims them at exit.
     std::process::exit(0);
@@ -1068,7 +1089,7 @@ impl<T> Scratch<T> {
 const SMALL: usize = 8;
 
 /// How many events ahead phase C prefetches user names.
-const NAME_PF: usize = 0;
+const NAME_PF: usize = 24;
 
 /// Appends `b` sorted by (key, tsoff, input index) to `out`; false (nothing appended) if the
 /// packed keys would not fit in 64 bits.
