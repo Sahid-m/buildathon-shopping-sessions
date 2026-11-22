@@ -1,0 +1,12 @@
+# Build stage: compile the pipeline as a static-ish release binary.
+FROM rust:1.91-slim-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
+
+# Run stage: minimal image, the binary only.
+FROM debian:bookworm-slim
+COPY --from=build /src/target/release/sessions /app/sessions
+USER 1000:1000
+CMD ["/app/sessions"]
