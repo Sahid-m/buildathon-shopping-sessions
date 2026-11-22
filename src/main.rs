@@ -64,6 +64,9 @@ struct EvA {
     price_ts_hi: u32,  // 4B: low 24b = price (0 if not purchase), high 8b = high 8b of (ts - ws) -> 32B total
 }
 
+// Events B packs a record's position in its chunk into 11 bits.
+const _: () = assert!(List::<EvA>::cap() <= 2048);
+
 impl EvA {
     #[inline(always)]
     fn ingest(&self) -> u64 {
@@ -739,6 +742,8 @@ fn main() {
         for t in 0..nt {
             s.spawn(move || {
                 let mut tab: Vec<u64> = Vec::new();
+                let mut subs: Vec<Vec<u64>> = Vec::new();
+                let mut bases: Vec<*mut EvA> = Vec::new();
                 let mut g = ev_c_ref[t].lock().unwrap();
                 let mut st = wc::Stager::<EvC, 8>::new(npc);
                 // Survivors wait in a small ring while their pmap home slot is prefetched.
@@ -754,36 +759,62 @@ fn main() {
                     if n == 0 {
                         continue;
                     }
-                    let cap = (n + n / 3).next_power_of_two().max(16);
-                    let mask = cap - 1;
-                    if tab.len() < cap {
-                        tab.resize(cap, 0);
+                    // Split the partition into 2^sbits sub-buckets by more event-hash bits so
+                    // each sub-bucket's table (<= 128 KB) stays in L2. Pass 1 streams the records
+                    // once and appends an 8-byte entry per record to its sub-bucket:
+                    // (32 hash bits << 32) | record index, where the index is
+                    // (chunk number + 1) << 11 | position in chunk (nonzero, so 0 = empty slot).
+                    let sbits = n.div_ceil(16384).next_power_of_two().trailing_zeros();
+                    let ns = 1usize << sbits;
+                    if subs.len() < ns {
+                        subs.resize_with(ns, Vec::new);
                     }
-                    tab[..cap].fill(0);
-
-                    // Dedup in place: a slot holds a pointer to the current winner (low 48 bits)
-                    // and a 16-bit hash tag (high bits). The losing copy is marked dead by
-                    // setting its dt to INVALID_DT, which the emit pass skips anyway; the
-                    // winner keeps its own dt, so an invalid winner still drops the event.
+                    for v in &mut subs[..ns] {
+                        v.clear();
+                    }
+                    bases.clear();
+                    bases.push(std::ptr::null_mut());
                     for tv in &parts {
-                        tv.for_slices_raw(|base, len| for k in 0..len {
-                            let rp = unsafe { base.add(k) };
-                            let r = unsafe { &*rp };
-                            let h = r.ehash;
-                            let tag = (h & 0xFFFF) << 48;
-                            let mut i = (h >> 16) as usize & mask;
+                        tv.for_slices_raw(|base, len| {
+                            let ci = bases.len() as u64;
+                            bases.push(base);
+                            for k in 0..len {
+                                let h32 = (unsafe { (*base.add(k)).ehash } >> 16) as u32;
+                                let e = ((h32 as u64) << 32) | (ci << 11) | k as u64;
+                                let sb = if sbits == 0 { 0 } else { (h32 >> (32 - sbits)) as usize };
+                                unsafe { subs.get_unchecked_mut(sb) }.push(e);
+                            }
+                        });
+                    }
+                    let rec = |e: u64| unsafe {
+                        bases.get_unchecked(((e as u32) >> 11) as usize).add((e & 0x7FF) as usize)
+                    };
+
+                    // Dedup in place per sub-bucket: a slot holds the current winner's entry.
+                    // The losing copy is marked dead by setting its dt to INVALID_DT, which the
+                    // emit pass skips anyway; the winner keeps its own dt, so an invalid winner
+                    // still drops the event.
+                    for sv in &subs[..ns] {
+                        let cap = (sv.len() + sv.len() / 3).next_power_of_two().max(16);
+                        let mask = cap - 1;
+                        if tab.len() < cap {
+                            tab.resize(cap, 0);
+                        }
+                        tab[..cap].fill(0);
+                        for &e in sv {
+                            let mut i = (e >> 32) as usize & mask;
                             loop {
                                 let slot = unsafe { *tab.get_unchecked(i) };
                                 if slot == 0 {
-                                    unsafe { *tab.get_unchecked_mut(i) = tag | rp as u64 };
+                                    unsafe { *tab.get_unchecked_mut(i) = e };
                                     break;
                                 }
-                                if (slot & 0xFFFF_0000_0000_0000) == tag {
-                                    let bp = (slot & 0x0000_FFFF_FFFF_FFFF) as *mut EvA;
-                                    let b = unsafe { &mut *bp };
-                                    if b.ehash == h {
+                                if (slot >> 32) == (e >> 32) {
+                                    let (bp, rp) = (rec(slot), rec(e));
+                                    let (b, r) = unsafe { (&*bp, &*rp) };
+                                    if b.ehash == r.ehash {
                                         let dead = if r.ingest() < b.ingest() {
-                                            unsafe { *tab.get_unchecked_mut(i) = tag | rp as u64 };
+                                            unsafe { *tab.get_unchecked_mut(i) = e };
                                             bp
                                         } else {
                                             rp
@@ -797,7 +828,7 @@ fn main() {
                                 }
                                 i = (i + 1) & mask;
                             }
-                        });
+                        }
                     }
 
                     let mut m = 0usize;
