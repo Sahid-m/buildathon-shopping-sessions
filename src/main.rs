@@ -414,7 +414,8 @@ fn main() {
             drop(parent);
 
             // Help process remaining event chunks
-            let mut g = ev_a_ref[0].lock().unwrap();
+            let mut gg = ev_a_ref[0].lock().unwrap();
+            let mut g = Wc::new(&mut gg);
             loop {
                 let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                 if ci >= ev_chunks_ref.len() {
@@ -431,11 +432,13 @@ fn main() {
                     &mut g,
                 );
             }
+            g.finish();
         });
 
         for t in 1..nt {
             s.spawn(move || {
-                let mut g = ev_a_ref[t].lock().unwrap();
+                let mut gg = ev_a_ref[t].lock().unwrap();
+                let mut g = Wc::new(&mut gg);
                 loop {
                     let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks_ref.len() {
@@ -452,6 +455,7 @@ fn main() {
                         &mut g,
                     );
                 }
+                g.finish();
             });
         }
     });
@@ -513,7 +517,7 @@ fn main() {
             }
             let r = &tmp[i];
             let (pkey, _) = person_of(r.uh, Str(0));
-            g[(pkey >> 56) as usize].push(ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
+            push_pf(&mut g[(pkey >> 56) as usize], ClC { pkey, ts: r.ts, cid: r.cid, camp: r.camp });
         }
     });
     drop(cl_tmp);
@@ -596,7 +600,7 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        g[(pkey >> 56) as usize].push(EvC {
+                        push_pf(&mut g[(pkey >> 56) as usize], EvC {
                             pkey,
                             ts: ws + dt as i64,
                             name,
@@ -988,6 +992,107 @@ fn sort_bucket<T: Copy>(
     true
 }
 
+/// Pushes onto one of many partition Vecs, first pulling in the output line a few records
+/// ahead: hundreds of interleaved write streams defeat the hardware prefetcher, so each new
+/// line would otherwise stall a store on a cache miss.
+#[inline(always)]
+fn push_pf<T>(v: &mut Vec<T>, x: T) {
+    let ahead = (128 / std::mem::size_of::<T>().max(1)).max(1);
+    csv::prefetch(v.as_ptr().wrapping_add(v.len() + ahead) as *const u8);
+    v.push(x);
+}
+
+/// Write-combining scatter of EvA records into NP partition Vecs. Each partition gathers
+/// WB records in a small cache-resident buffer; a full buffer is written out as whole,
+/// 64-byte-aligned cache lines with non-temporal stores (no read-for-ownership of the
+/// destination lines, which 256 streams would otherwise miss on).
+const WB: usize = 16; // 16 * 40 B = 640 B = 10 cache lines
+
+struct Wc<'a> {
+    g: &'a mut [Vec<EvA>],
+    buf: Vec<[EvA; WB]>,
+    n: [u8; NP],
+}
+
+impl<'a> Wc<'a> {
+    fn new(g: &'a mut [Vec<EvA>]) -> Wc<'a> {
+        assert!(g.len() == NP);
+        let z = EvA { ehash: 0, uh: 0, ingest_cat: 0, user: Str(0), ts_lo: 0, price_ts_hi: 0 };
+        Wc { g, buf: vec![[z; WB]; NP], n: [0; NP] }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, p: usize, e: EvA) {
+        let k = unsafe { *self.n.get_unchecked(p) } as usize;
+        unsafe { *self.buf.get_unchecked_mut(p).get_unchecked_mut(k) = e };
+        if k + 1 < WB {
+            unsafe { *self.n.get_unchecked_mut(p) = (k + 1) as u8 };
+        } else {
+            self.flush(p);
+        }
+    }
+
+    #[inline(never)]
+    fn flush(&mut self, p: usize) {
+        let v = unsafe { self.g.get_unchecked_mut(p) };
+        let b = unsafe { self.buf.get_unchecked_mut(p) };
+        v.reserve(WB);
+        let len = v.len();
+        let dst = unsafe { v.as_mut_ptr().add(len) };
+        let mis = dst as usize & 63;
+        if mis == 0 {
+            unsafe { stream_wb(dst as *mut u8, b.as_ptr() as *const u8) };
+            unsafe { v.set_len(len + WB) };
+            self.n[p] = 0;
+            return;
+        }
+        // Not aligned: write the fewest records that end on a line boundary (if any) with
+        // plain stores, keep the rest buffered.
+        let mut m = WB;
+        for j in 1..WB {
+            if (dst as usize + j * std::mem::size_of::<EvA>()) & 63 == 0 {
+                m = j;
+                break;
+            }
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.as_ptr(), dst, m);
+            v.set_len(len + m);
+        }
+        b.copy_within(m.., 0);
+        self.n[p] = (WB - m) as u8;
+    }
+
+    fn finish(&mut self) {
+        for p in 0..NP {
+            let k = self.n[p] as usize;
+            self.g[p].extend_from_slice(&self.buf[p][..k]);
+            self.n[p] = 0;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_sfence()
+        };
+    }
+}
+
+/// Copies 320 bytes to a 64-byte-aligned `dst`, bypassing the cache where supported.
+#[inline(always)]
+unsafe fn stream_wb(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    unsafe {
+        use core::arch::x86_64::*;
+        for i in 0..20 {
+            let x = _mm256_loadu_si256(src.add(i * 32) as *const __m256i);
+            _mm256_stream_si256(dst.add(i * 32) as *mut __m256i, x);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, 640);
+    }
+}
+
 #[inline(always)]
 fn process_ev_chunk(
     ci: usize,
@@ -997,7 +1102,7 @@ fn process_ev_chunk(
     ws: i64,
     we: i64,
     unknown_cat: u16,
-    g: &mut [Vec<EvA>],
+    g: &mut Wc,
 ) {
     let (fi, s, e) = ev_chunks[ci];
     let d: &[u8] = &ev_maps[fi][s..e];
@@ -1042,11 +1147,7 @@ fn process_ev_chunk(
         }
         let p = (ehash >> 56) as usize;
         let uh = hash64(key128(f[1]));
-        let v = unsafe { g.get_unchecked_mut(p) };
-        // Pull the next output line of this partition in ahead of its write (256 streams
-        // defeat the hardware prefetcher, so each new line would otherwise stall a store).
-        csv::prefetch(v.as_ptr().wrapping_add(v.len() + 3) as *const u8);
-        v.push(EvA {
+        g.push(p, EvA {
             ehash,
             uh,
             ingest_cat: ing_u | ((cat as u64) << 52),
