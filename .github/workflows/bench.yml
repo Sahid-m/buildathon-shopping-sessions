@@ -3,11 +3,10 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "4b93fd0:x86-64-v3 eae1cf8:x86-64-v3 129036e:x86-64-v3"
+  VARIANTS: "eae1cf8:x86-64-v3 dae9f7c:x86-64-v3"
 on:
   push:
-    branches: [bench]
-    paths: ['.github/workflows/bench.yml']
+    branches: [onepass-bench]
   workflow_dispatch:
     inputs:
       shas:
