@@ -1068,7 +1068,7 @@ impl<T> Scratch<T> {
 const SMALL: usize = 8;
 
 /// How many events ahead phase C prefetches user names.
-const NAME_PF: usize = 64;
+const NAME_PF: usize = 0;
 
 /// Appends `b` sorted by (key, tsoff, input index) to `out`; false (nothing appended) if the
 /// packed keys would not fit in 64 bits.
