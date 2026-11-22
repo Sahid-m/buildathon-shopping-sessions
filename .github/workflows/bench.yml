@@ -3,11 +3,10 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "4b93fd0:x86-64-v3 4b93fd0:x86-64-v3:GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432 5b103b8:x86-64-v3:GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432"
+  VARIANTS: "4b93fd0:x86-64-v3 0cac070:x86-64-v3 2be5eee:x86-64-v3"
 on:
   push:
-    branches: [bench]
-    paths: ['.github/workflows/bench.yml']
+    branches: [hashx-bench]
   workflow_dispatch:
     inputs:
       shas:
