@@ -151,14 +151,6 @@ impl ClC {
     }
 }
 
-struct UdRow {
-    name: Str,
-    day: i32,
-    sessions: i64,
-    events: i64,
-    revenue: i64,
-}
-
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(16))]
 struct CampCell {
@@ -886,17 +878,28 @@ fn main() {
         let TOut { ud, camp, assisted } = &mut *g;
         let mut cnt = vec![0u32; ncamp];
         let mut pos = vec![0u32; ncamp];
-        let mut active: Vec<u16> = vec![];
+        // Assists are settled lazily: base[c] is the number of the person's sessions on the
+        // open day that came before campaign c turned active, so c assisted rses - base[c] of
+        // that day's sessions. They are added when c leaves the window, the day changes or the
+        // person ends, instead of one increment per active campaign per session.
+        let mut base = vec![0u32; ncamp];
+        // Campaigns with a click in the window: active[..nact]. One spare slot, so an
+        // unconditional write at active[nact] stays in bounds.
+        let mut active: Vec<u16> = vec![0; ncamp + 1];
+        let mut nact = 0usize;
         let mut catsum = vec![0i64; ncat];
         let mut cat_touched: Vec<u16> = vec![];
+        let n = evs.len();
+        let organic = ncamp * ndays;
         let mut ci = 0usize;
         let mut i = 0usize;
-        // User names are random reads into the input; prefetch each person's name once, about
-        // NAME_PF events ahead of where it is copied to the output.
+        // User names are random reads into the input; prefetch them about NAME_PF events ahead
+        // of where they are copied to the output. Every event of a person carries the same
+        // name, so prefetching per event (repeats hit L1) needs no person-boundary branch.
         let mut pf = 0usize;
-        while i < evs.len() {
+        while i < n {
             let pk = evs[i].pkey;
-            let pf_end = (i + NAME_PF).min(evs.len());
+            let pf_end = (i + NAME_PF).min(n);
             while pf < pf_end {
                 if pf == 0 || evs[pf].pkey != evs[pf - 1].pkey {
                     let nm = evs[pf].name.get();
@@ -904,10 +907,6 @@ fn main() {
                     csv::prefetch(nm.as_ptr().wrapping_add(nm.len().saturating_sub(1)));
                 }
                 pf += 1;
-            }
-            let mut j = i;
-            while j < evs.len() && evs[j].pkey == pk {
-                j += 1;
             }
             while ci < cls.len() && cls[ci].pkey < pk {
                 ci += 1;
@@ -917,26 +916,42 @@ fn main() {
                 cj += 1;
             }
             let pc = &cls[ci..cj];
+            ci = cj;
             let name = evs[i].name;
             let (mut lo, mut hi) = (0usize, 0usize);
-            let mut cur: Option<UdRow> = None;
+            // The open user_daily row (person, rday).
+            let mut rday = i32::MIN;
+            let (mut rses, mut revn, mut rrev) = (0i64, 0i64, 0i64);
             let mut k = i;
-            while k < j {
-                let start = evs[k].ts(ws);
+            loop {
+                let s0 = evs[k].dt();
+                let start = ws + s0;
                 let day = start.div_euclid(DAY) as i32;
-                let di = (start.div_euclid(DAY) - day0) as usize;
-                if cur.as_ref().map(|c| c.day != day).unwrap_or(false) {
-                    let row = cur.take().unwrap();
-                    let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
-                    ud.push(row.name.get(), row.day, row.sessions, row.events, row.revenue, top);
+                let di = (day as i64 - day0) as usize;
+                if day != rday {
+                    if rday != i32::MIN {
+                        let odi = (rday as i64 - day0) as usize;
+                        for &c in &active[..nact] {
+                            let c = c as usize;
+                            assisted[c * ndays + odi] += rses as u32 - base[c];
+                            base[c] = 0;
+                        }
+                        let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
+                        ud.push(name.get(), rday, rses, revn, rrev, top);
+                    }
+                    rday = day;
+                    rses = 0;
+                    revn = 0;
+                    rrev = 0;
                 }
-                let mut last = start;
+                let mut last = s0;
                 let mut m = k;
                 let mut rev = 0i64;
                 let mut purchased = false;
-                while m < j && evs[m].ts(ws) - last <= GAP {
+                // One branch per event: same person and gap within 30 minutes.
+                while m < n && ((evs[m].pkey == pk) & (evs[m].dt() - last <= GAP)) {
                     let e = &evs[m];
-                    last = e.ts(ws);
+                    last = e.dt();
                     if e.purchase() {
                         let (price, cat) = (e.price() as i64, e.cat());
                         purchased = true;
@@ -948,65 +963,77 @@ fn main() {
                     }
                     m += 1;
                 }
-                let nev = (m - k) as i64;
-                let row = cur.get_or_insert(UdRow { name, day, sessions: 0, events: 0, revenue: 0 });
-                row.sessions += 1;
-                row.events += nev;
-                row.revenue += rev;
-                // attribution
-                while hi < pc.len() && (cws + pc[hi].dt()) <= start {
-                    let c = pc[hi].camp() as usize;
-                    if cnt[c] == 0 {
-                        pos[c] = active.len() as u32;
-                        active.push(c as u16);
-                    }
-                    cnt[c] += 1;
-                    hi += 1;
-                }
-                while lo < hi && (cws + pc[lo].dt()) < start - WEEK {
-                    let c = pc[lo].camp() as usize;
-                    cnt[c] -= 1;
-                    if cnt[c] == 0 {
-                        let p = pos[c] as usize;
-                        let lastc = *active.last().unwrap();
-                        active[p] = lastc;
-                        pos[lastc as usize] = p as u32;
-                        active.pop();
-                    }
-                    lo += 1;
-                }
-                let credited = if hi > lo {
-                    let mt = cws + pc[hi - 1].dt();
-                    let mut b = hi - 1;
-                    let mut q = hi - 1;
-                    while q > lo && (cws + pc[q - 1].dt()) == mt {
-                        q -= 1;
-                        if pc[q].cid.get() < pc[b].cid.get() {
-                            b = q;
-                        }
-                    }
-                    for &c in &active {
-                        assisted[c as usize * ndays + di] += 1;
-                    }
-                    pc[b].camp() as usize
+                // Sessions earlier on this day, for assist bases.
+                let before = rses as u32;
+                rses += 1;
+                revn += (m - k) as i64;
+                rrev += rev;
+                k = m;
+                let credited = if pc.is_empty() {
+                    organic
                 } else {
-                    ncamp
+                    // attribution; click times are offsets from cws
+                    let sc = start - cws;
+                    while hi < pc.len() && pc[hi].dt() <= sc {
+                        let c = pc[hi].camp() as usize;
+                        let z = (cnt[c] == 0) as usize;
+                        active[nact] = c as u16;
+                        pos[c] = if z != 0 { nact as u32 } else { pos[c] };
+                        base[c] = if z != 0 { before } else { base[c] };
+                        nact += z;
+                        cnt[c] += 1;
+                        hi += 1;
+                    }
+                    while lo < hi && pc[lo].dt() < sc - WEEK {
+                        let c = pc[lo].camp() as usize;
+                        cnt[c] -= 1;
+                        let z = cnt[c] == 0;
+                        // When c leaves, settle its assists on this day so far.
+                        assisted[c * ndays + di] += if z { before - base[c] } else { 0 };
+                        let p = pos[c] as usize;
+                        let lastc = active[nact - 1];
+                        // While c stays active, active[p] is c itself.
+                        active[p] = if z { lastc } else { c as u16 };
+                        pos[lastc as usize] = if z { p as u32 } else { pos[lastc as usize] };
+                        nact -= z as usize;
+                        lo += 1;
+                    }
+                    if hi > lo {
+                        let mt = pc[hi - 1].dt();
+                        let mut b = hi - 1;
+                        let mut q = hi - 1;
+                        while q > lo && pc[q - 1].dt() == mt {
+                            q -= 1;
+                            if pc[q].cid.get() < pc[b].cid.get() {
+                                b = q;
+                            }
+                        }
+                        pc[b].camp() as usize * ndays
+                    } else {
+                        organic
+                    }
                 };
-                let r = &mut camp[credited * ndays + di];
+                let r = &mut camp[credited + di];
                 r.rev += rev as u64;
                 r.ses += 1;
                 r.pur += purchased as u32;
-                k = m;
+                if k >= n || evs[k].pkey != pk {
+                    break;
+                }
             }
-            if let Some(row) = cur.take() {
-                let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
-                ud.push(row.name.get(), row.day, row.sessions, row.events, row.revenue, top);
+            let top = top_cat(&mut catsum, &mut cat_touched).map(|c| cat_strs[c as usize]);
+            ud.push(name.get(), rday, rses, revn, rrev, top);
+            let odi = (rday as i64 - day0) as usize;
+            for &c in &active[..nact] {
+                let c = c as usize;
+                assisted[c * ndays + odi] += rses as u32 - base[c];
+                base[c] = 0;
             }
             for q in lo..hi {
                 cnt[pc[q].camp() as usize] = 0;
             }
-            active.clear();
-            i = j;
+            nact = 0;
+            i = k;
         }
     }, |t| {
         // This thread's user_daily rows are complete: write them while others finish.
