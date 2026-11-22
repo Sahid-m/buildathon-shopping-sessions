@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "4b93fd0:x86-64-v3 7fcdbdf:x86-64-v3:SS_NPBITS=8 7fcdbdf:x86-64-v3:SS_NPBITS=9 7fcdbdf:x86-64-v3:SS_NPBITS=10 7fcdbdf:x86-64-v3"
+  VARIANTS: "4b93fd0:x86-64-v3 5ff80e3:x86-64-v3:SS_NPABITS=8:SS_NPCBITS=10 5ff80e3:x86-64-v3:SS_NPABITS=9:SS_NPCBITS=10 5ff80e3:x86-64-v3:SS_NPABITS=10:SS_NPCBITS=10 5ff80e3:x86-64-v3"
 on:
   push:
     branches: [np-bench]
@@ -50,7 +50,7 @@ jobs:
           }
           for i in 1 2 3 4; do
             for s in $SHAS; do
-              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3)
+              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3- | tr ':' ' ')
               run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
             done
           done
@@ -67,7 +67,7 @@ jobs:
           du -sh /dev/shm/s60; free -g
       - name: time 60M
         run: |
-          V60="4b93fd0:x86-64-v3 7fcdbdf:x86-64-v3:SS_NPBITS=8 7fcdbdf:x86-64-v3:SS_NPBITS=9 7fcdbdf:x86-64-v3:SS_NPBITS=10 7fcdbdf:x86-64-v3:SS_NPBITS=11"
+          V60="4b93fd0:x86-64-v3 5ff80e3:x86-64-v3:SS_NPABITS=8:SS_NPCBITS=10 5ff80e3:x86-64-v3:SS_NPABITS=9:SS_NPCBITS=10 5ff80e3:x86-64-v3:SS_NPABITS=10:SS_NPCBITS=10 5ff80e3:x86-64-v3:SS_NPABITS=8:SS_NPCBITS=11"
           run() {
             local label=$1 bin=$2; shift 2
             rm -rf /tmp/out
@@ -76,7 +76,7 @@ jobs:
           }
           for i in 1 2 3; do
             for s in $V60; do
-              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3)
+              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3- | tr ':' ' ')
               run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
             done
           done
@@ -84,5 +84,5 @@ jobs:
         run: |
           rm -rf /tmp/o-a /tmp/o-b /tmp/out
           SS_QUIET=1 /tmp/b-4b93fd0-x86-64-v3/target/release/sessions /dev/shm/s60 /tmp/o-a
-          SS_QUIET=1 /tmp/b-7fcdbdf-x86-64-v3/target/release/sessions /dev/shm/s60 /tmp/o-b
+          SS_QUIET=1 /tmp/b-5ff80e3-x86-64-v3/target/release/sessions /dev/shm/s60 /tmp/o-b
           python3 /tmp/src-4b93fd0/scripts/compare.py /tmp/o-a /tmp/o-b 2>&1 | tail -1
