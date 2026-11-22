@@ -5,6 +5,7 @@ name: bench
 on:
   push:
     branches: [bench]
+    paths: ['.github/workflows/bench.yml']
   workflow_dispatch:
     inputs:
       shas:

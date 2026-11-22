@@ -1,10 +1,10 @@
 # x86 profile of one commit: per-phase single-thread costs and a perf report (not part of the submission).
 name: profile
 on:
-  workflow_dispatch:
-    inputs:
-      sha:
-        default: "c97bfa7"
+  push:
+    branches: [prof]
+env:
+  SHA: c97bfa7
 jobs:
   profile:
     runs-on: ubuntu-latest
@@ -20,7 +20,7 @@ jobs:
           which perf; perf --version || ls /usr/lib/linux-tools*/
           cd tools/generator && cargo build --release -q && cd -
           tools/generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/s20 >/dev/null
-          S=${{ github.event.inputs.sha }}
+          S=$SHA
           git worktree add -q /tmp/v3 $S; git worktree add -q /tmp/v1 $S
           (cd /tmp/v3 && RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -q)
           (cd /tmp/v1 && cargo build --release -q)
