@@ -6,6 +6,7 @@ mod keys;
 mod parse_fuzz;
 mod pq;
 mod ts;
+mod wc;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -415,6 +416,7 @@ fn main() {
 
             // Help process remaining event chunks
             let mut g = ev_a_ref[0].lock().unwrap();
+                let mut st = wc::Stager::<EvA, 8>::new(NP);
             loop {
                 let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                 if ci >= ev_chunks_ref.len() {
@@ -429,13 +431,16 @@ fn main() {
                     we,
                     unknown_cat,
                     &mut g,
+                    &mut st,
                 );
             }
+            st.finish(&mut g);
         });
 
         for t in 1..nt {
             s.spawn(move || {
                 let mut g = ev_a_ref[t].lock().unwrap();
+                let mut st = wc::Stager::<EvA, 8>::new(NP);
                 loop {
                     let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks_ref.len() {
@@ -450,8 +455,10 @@ fn main() {
                         we,
                         unknown_cat,
                         &mut g,
+                        &mut st,
                     );
                 }
+                st.finish(&mut g);
             });
         }
     });
@@ -998,6 +1005,7 @@ fn process_ev_chunk(
     we: i64,
     unknown_cat: u16,
     g: &mut [Vec<EvA>],
+    st: &mut wc::Stager<EvA, 8>,
 ) {
     let (fi, s, e) = ev_chunks[ci];
     let d: &[u8] = &ev_maps[fi][s..e];
@@ -1042,7 +1050,7 @@ fn process_ev_chunk(
         }
         let p = (ehash >> 56) as usize;
         let uh = hash64(key128(f[1]));
-        g[p].push(EvA {
+        st.push(g, p, EvA {
             ehash,
             uh,
             ingest_cat: ing_u | ((cat as u64) << 52),
