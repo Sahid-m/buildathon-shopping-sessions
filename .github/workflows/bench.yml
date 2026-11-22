@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "4b93fd0:x86-64-v3 0cac070:x86-64-v3 2be5eee:x86-64-v3"
+  VARIANTS: "4b93fd0:x86-64-v3 0cac070:x86-64-v3 2be5eee:x86-64-v3 19454ed:x86-64-v3"
 on:
   push:
     branches: [hashx-bench]
