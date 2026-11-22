@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "c97bfa7:x86-64-v3 24de0d7:x86-64-v3"
+  VARIANTS: "c97bfa7:x86-64-v3 2921d31:x86-64-v3 2921d31:x86-64-v3:SS_POP=1"
 on:
   push:
     branches: [bench]
@@ -35,9 +35,9 @@ jobs:
           SHAS="${VARIANTS}"
           echo "SHAS=$SHAS" >> $GITHUB_ENV
           for v in $SHAS; do
-            sha=${v%%:*}; cpu=${v#*:}
+            sha=$(echo $v | cut -d: -f1); cpu=$(echo $v | cut -d: -f2)
             [ -d /tmp/src-$sha ] || git worktree add -q /tmp/src-$sha $sha
-            d=/tmp/b-$(echo $v | tr ':' '_')
+            d=/tmp/b-$sha-$cpu
             rm -rf $d; cp -r /tmp/src-$sha $d
             (cd $d && RUSTFLAGS="-C target-cpu=$cpu" cargo build --release -q)
           done
@@ -51,12 +51,13 @@ jobs:
           }
           for i in 1 2 3 4; do
             for s in $SHAS; do
-              run "$s" /tmp/b-$(echo $s | tr ':' '_')/target/release/sessions
+              sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); ev=$(echo $s | cut -d: -f3)
+              run "$s" /tmp/b-$sha-$cpu/target/release/sessions $ev
             done
           done
       - name: check outputs agree
         run: |
           pip install -q pyarrow polars
           set -- $SHAS
-          i=0; for s in "$@"; do i=$((i+1)); rm -rf /tmp/o-$i; SS_QUIET=1 /tmp/b-$(echo $s | tr ':' '_')/target/release/sessions /dev/shm/s20 /tmp/o-$i; done
+          i=0; for s in "$@"; do i=$((i+1)); sha=$(echo $s | cut -d: -f1); cpu=$(echo $s | cut -d: -f2); rm -rf /tmp/o-$i; SS_QUIET=1 /tmp/b-$sha-$cpu/target/release/sessions /dev/shm/s20 /tmp/o-$i; done
           for j in $(seq 2 $i); do python3 /tmp/src-c97bfa7/scripts/compare.py /tmp/o-1 /tmp/o-$j | tail -1; done
