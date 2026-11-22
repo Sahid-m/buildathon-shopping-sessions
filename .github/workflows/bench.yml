@@ -3,7 +3,7 @@
 # scorer, and times the given commits.
 name: bench
 env:
-  VARIANTS: "129036e:x86-64-v3 2938847:x86-64-v3 d35beaf:x86-64-v3"
+  VARIANTS: "129036e:x86-64-v3 d35beaf:x86-64-v3 ab900d7:x86-64-v3 3b486b7:x86-64-v3"
 on:
   push:
     branches: [pcout-bench]
