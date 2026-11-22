@@ -415,7 +415,7 @@ fn main() {
 
             // Help process remaining event chunks
             let mut gg = ev_a_ref[0].lock().unwrap();
-            let mut g = Wc::new(&mut gg);
+            let mut g = Wc::new(&mut gg, EVA0);
             loop {
                 let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                 if ci >= ev_chunks_ref.len() {
@@ -438,7 +438,7 @@ fn main() {
         for t in 1..nt {
             s.spawn(move || {
                 let mut gg = ev_a_ref[t].lock().unwrap();
-                let mut g = Wc::new(&mut gg);
+                let mut g = Wc::new(&mut gg, EVA0);
                 loop {
                     let ci = next_ev_ref.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks_ref.len() {
@@ -539,7 +539,9 @@ fn main() {
             s.spawn(move || {
                 let mut tab: Vec<u64> = Vec::new();
                 let mut best: Vec<EvA> = Vec::new();
-                let mut g = ev_c_ref[t].lock().unwrap();
+                let mut gg = ev_c_ref[t].lock().unwrap();
+                let z = EvC { pkey: 0, ts: 0, name: Str(0), price: 0, cat: 0, purchase: false };
+                let mut g = Wc::new(&mut gg, z);
                 loop {
                     let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
                     if p >= NP {
@@ -600,7 +602,7 @@ fn main() {
                         }
                         let (pkey, name) = person_of(r.uh, r.user);
                         let price = r.price();
-                        push_pf(&mut g[(pkey >> 56) as usize], EvC {
+                        g.push((pkey >> 56) as usize, EvC {
                             pkey,
                             ts: ws + dt as i64,
                             name,
@@ -610,6 +612,7 @@ fn main() {
                         });
                     }
                 }
+                g.finish();
             });
         }
     });
@@ -1006,23 +1009,24 @@ fn push_pf<T>(v: &mut Vec<T>, x: T) {
 /// WB records in a small cache-resident buffer; a full buffer is written out as whole,
 /// 64-byte-aligned cache lines with non-temporal stores (no read-for-ownership of the
 /// destination lines, which 256 streams would otherwise miss on).
+const EVA0: EvA = EvA { ehash: 0, uh: 0, ingest_cat: 0, user: Str(0), ts_lo: 0, price_ts_hi: 0 };
 const WB: usize = 16; // 16 * 40 B = 640 B = 10 cache lines
 
-struct Wc<'a> {
-    g: &'a mut [Vec<EvA>],
-    buf: Vec<[EvA; WB]>,
+struct Wc<'a, T: Copy> {
+    g: &'a mut [Vec<T>],
+    buf: Vec<[T; WB]>,
     n: [u8; NP],
 }
 
-impl<'a> Wc<'a> {
-    fn new(g: &'a mut [Vec<EvA>]) -> Wc<'a> {
-        assert!(g.len() == NP);
-        let z = EvA { ehash: 0, uh: 0, ingest_cat: 0, user: Str(0), ts_lo: 0, price_ts_hi: 0 };
+impl<'a, T: Copy> Wc<'a, T> {
+    /// `z` is any value of T (it only fills the empty buffers).
+    fn new(g: &'a mut [Vec<T>], z: T) -> Wc<'a, T> {
+        assert!(g.len() == NP && (WB * std::mem::size_of::<T>()) % 64 == 0);
         Wc { g, buf: vec![[z; WB]; NP], n: [0; NP] }
     }
 
     #[inline(always)]
-    fn push(&mut self, p: usize, e: EvA) {
+    fn push(&mut self, p: usize, e: T) {
         let k = unsafe { *self.n.get_unchecked(p) } as usize;
         unsafe { *self.buf.get_unchecked_mut(p).get_unchecked_mut(k) = e };
         if k + 1 < WB {
@@ -1041,7 +1045,7 @@ impl<'a> Wc<'a> {
         let dst = unsafe { v.as_mut_ptr().add(len) };
         let mis = dst as usize & 63;
         if mis == 0 {
-            unsafe { stream_wb(dst as *mut u8, b.as_ptr() as *const u8) };
+            unsafe { stream_lines(dst as *mut u8, b.as_ptr() as *const u8, WB * std::mem::size_of::<T>()) };
             unsafe { v.set_len(len + WB) };
             self.n[p] = 0;
             return;
@@ -1050,7 +1054,7 @@ impl<'a> Wc<'a> {
         // plain stores, keep the rest buffered.
         let mut m = WB;
         for j in 1..WB {
-            if (dst as usize + j * std::mem::size_of::<EvA>()) & 63 == 0 {
+            if (dst as usize + j * std::mem::size_of::<T>()) & 63 == 0 {
                 m = j;
                 break;
             }
@@ -1076,20 +1080,21 @@ impl<'a> Wc<'a> {
     }
 }
 
-/// Copies 320 bytes to a 64-byte-aligned `dst`, bypassing the cache where supported.
+/// Copies `bytes` (a multiple of 64) to a 64-byte-aligned `dst`, bypassing the cache where
+/// supported.
 #[inline(always)]
-unsafe fn stream_wb(dst: *mut u8, src: *const u8) {
+unsafe fn stream_lines(dst: *mut u8, src: *const u8, bytes: usize) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
     unsafe {
         use core::arch::x86_64::*;
-        for i in 0..20 {
+        for i in 0..bytes / 32 {
             let x = _mm256_loadu_si256(src.add(i * 32) as *const __m256i);
             _mm256_stream_si256(dst.add(i * 32) as *mut __m256i, x);
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
     unsafe {
-        std::ptr::copy_nonoverlapping(src, dst, 640);
+        std::ptr::copy_nonoverlapping(src, dst, bytes);
     }
 }
 
@@ -1102,7 +1107,7 @@ fn process_ev_chunk(
     ws: i64,
     we: i64,
     unknown_cat: u16,
-    g: &mut Wc,
+    g: &mut Wc<EvA>,
 ) {
     let (fi, s, e) = ev_chunks[ci];
     let d: &[u8] = &ev_maps[fi][s..e];
