@@ -1011,6 +1011,12 @@ fn process_ev_chunk(
 ) {
     let (fi, s, e) = ev_chunks[ci];
     let d: &[u8] = &ev_maps[fi][s..e];
+    let dend = d.as_ptr() as usize + d.len();
+    // event.ts mixes its forms at random: parse it without format branches when the 25
+    // bytes from its start lie inside the chunk.
+    let parse_t = |b: &[u8]| -> Option<i64> {
+        if b.as_ptr() as usize + 25 <= dend { unsafe { ts::parse_ts_wide(b) } } else { ts::parse_ts(b) }
+    };
     csv::for_rows::<7, _>(d, |f| {
         if f[0].is_empty() {
             return;
@@ -1032,7 +1038,7 @@ fn process_ev_chunk(
             let ty = f[4];
             if ty == b"purchase" {
                 let Some(p) = csv::parse_price(f[6]) else { break 'v };
-                let Some(t) = ts::parse_ts(f[2]) else { break 'v };
+                let Some(t) = parse_t(f[2]) else { break 'v };
                 if t < ws || t >= we || ingest_raw - t > DAY {
                     break 'v;
                 }
@@ -1043,7 +1049,7 @@ fn process_ev_chunk(
                 };
                 dt = (t - ws) as u64;
             } else if ty == b"view" || ty == b"cart" {
-                let Some(t) = ts::parse_ts(f[2]) else { break 'v };
+                let Some(t) = parse_t(f[2]) else { break 'v };
                 if t < ws || t >= we || ingest_raw - t > DAY {
                     break 'v;
                 }

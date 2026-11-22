@@ -249,3 +249,67 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     }
     parse_f3(b)
 }
+
+/// `parse_ts` without the format branches for the three regular forms (F1, F2, 13-digit F3),
+/// whose mix in `event.ts` is random enough to mispredict. Both the civil and the epoch
+/// parse run, and the result is selected. Safety: the 25 bytes starting at `b.as_ptr()`
+/// must be readable (they may lie past the end of `b`).
+#[inline(always)]
+pub unsafe fn parse_ts_wide(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let p = b.as_ptr();
+    let r8 = |i: usize| unsafe { (p.add(i) as *const u64).read_unaligned() };
+    let dash = unsafe { *p.add(4) } == b'-';
+    let civ_len = (n == 20) | (n == 25);
+    if !((n == 13) | (civ_len & dash)) {
+        return parse_ts(b);
+    }
+    // civil part (as civil19), branch-free
+    const T0: u64 = u64::from_le_bytes(*b"0000-00-");
+    const T1: u64 = u64::from_le_bytes(*b"00T00:00");
+    const T2: u64 = u64::from_le_bytes(*b"0:00:00\0");
+    const D0: u64 = u64::from_le_bytes([0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0]);
+    const F0: u64 = u64::from_le_bytes([0, 0, 0, 0, 0xFF, 0, 0, 0xFF]);
+    const D1: u64 = u64::from_le_bytes([0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF]);
+    const F1: u64 = u64::from_le_bytes([0, 0, 0xFF, 0, 0, 0xFF, 0, 0]);
+    const D2: u64 = u64::from_le_bytes([0, 0, 0, 0, 0, 0xFF, 0xFF, 0]);
+    const F2: u64 = u64::from_le_bytes([0, 0xFF, 0, 0, 0xFF, 0, 0, 0]);
+    let w0 = r8(0);
+    let x0 = w0 ^ T0;
+    let x1 = r8(8) ^ T1;
+    let x2 = r8(12) ^ T2;
+    let tok = tmpl_ok(x0, D0, F0) & tmpl_ok(x1, D1, F1) & tmpl_ok(x2, D2, F2);
+    let y = byte(x0, 0) * 1000 + byte(x0, 1) * 100 + byte(x0, 2) * 10 + byte(x0, 3);
+    let mo = byte(x0, 5) * 10 + byte(x0, 6);
+    let d = byte(x1, 0) * 10 + byte(x1, 1);
+    let h = byte(x1, 3) * 10 + byte(x1, 4);
+    let mi = byte(x1, 6) * 10 + byte(x1, 7);
+    let s = byte(x2, 5) * 10 + byte(x2, 6);
+    let yu = y as u32;
+    let leap = (yu % 4 == 0) & ((yu % 100 != 0) | (yu % 400 == 0));
+    let md = MDAYS[(mo & 15) as usize] as i64 + ((mo == 2) & leap) as i64;
+    let cok = tok & (mo >= 1) & (mo <= 12) & (d >= 1) & (d <= md) & (h <= 23) & (mi <= 59) & (s <= 59) & (y >= 1);
+    // keep the day arithmetic in range (and on its fast path) when the civil parse fails
+    let ys = if cok { y } else { 2000 };
+    let mos = if cok { mo } else { 1 };
+    let civ = (days_from_civil(ys, mos, d) * 86_400 + h * 3600 + mi * 60 + s) * 1000;
+    // F1 tail / F2 offset
+    let z = unsafe { *p.add(19) };
+    const T4: u64 = u64::from_le_bytes(*b"\0\0\x0000:00");
+    const DIG: u64 = u64::from_le_bytes([0, 0, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF]);
+    const FIX: u64 = u64::from_le_bytes([0, 0, 0, 0, 0, 0xFF, 0, 0]);
+    let x4 = r8(17) ^ T4;
+    let oh = byte(x4, 3) * 10 + byte(x4, 4);
+    let om = byte(x4, 6) * 10 + byte(x4, 7);
+    let ook = tmpl_ok(x4, DIG, FIX) & ((z == b'+') | (z == b'-')) & (oh <= 23) & (om <= 59);
+    let o = (oh * 60 + om) * 60_000;
+    let o = if z == b'-' { -o } else { o };
+    // 13-digit epoch
+    let w5 = r8(5);
+    let eok = all_digits8(w0) & all_digits8(w5);
+    let ep = (eight_digits(w0) * 100_000 + eight_digits(w5) % 100_000) as i64;
+    let is25 = n == 25;
+    let ok = if n == 13 { eok } else { cok & (if is25 { ook } else { z == b'Z' }) };
+    let v = if n == 13 { ep } else { civ - if is25 { o } else { 0 } };
+    if ok { Some(v) } else { None }
+}
