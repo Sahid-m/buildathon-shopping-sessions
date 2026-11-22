@@ -1,0 +1,37 @@
+# x86 profile of one commit: per-phase single-thread costs and a perf report (not part of the submission).
+name: profile
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        default: "c97bfa7"
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: setup
+        run: |
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -q linux-tools-azure >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+          which perf; perf --version || ls /usr/lib/linux-tools*/
+          cd tools/generator && cargo build --release -q && cd -
+          tools/generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/s20 >/dev/null
+          S=${{ github.event.inputs.sha }}
+          git worktree add -q /tmp/v3 $S; git worktree add -q /tmp/v1 $S
+          (cd /tmp/v3 && RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -q)
+          (cd /tmp/v1 && cargo build --release -q)
+      - name: phases
+        run: |
+          for b in v3 v1 v3 v1; do for n in 1 4; do rm -rf /tmp/o; echo "== $b NCPU=$n: $(NCPU=$n /tmp/$b/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | tr '\n' ' ' | sed 's/  */ /g')"; done; done
+      - name: perf
+        run: |
+          P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); P=${P:-perf}
+          rm -rf /tmp/o; NCPU=1 $P record -F 2000 -g -o /tmp/perf.data /tmp/v3/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | tail -2
+          $P report -i /tmp/perf.data --no-children --percent-limit 0.7 --stdio --sort sym 2>/dev/null | grep -v '^$' | grep -E '^ +[0-9]' | head -40
+          echo "== srcline"
+          $P report -i /tmp/perf.data --no-children --percent-limit 0.7 --stdio --sort srcline -g none 2>/dev/null | grep -E '^ +[0-9]' | head -60
+          rm -rf /tmp/o; NCPU=1 $P stat -e cycles,instructions,branch-misses,cache-misses,page-faults,dTLB-load-misses /tmp/v3/target/release/sessions /dev/shm/s20 /tmp/o 2>&1 | grep -E 'cycles|instr|miss|fault|elapsed'
