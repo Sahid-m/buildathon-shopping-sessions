@@ -162,6 +162,60 @@ fn small_lines(d: &[u8]) -> impl Iterator<Item = &[u8]> {
     lines.into_iter().skip(1)
 }
 
+fn resolve_links(edges: Vec<Vec<(Str, Str)>>) -> (KeyMap, Vec<(u128, Str)>) {
+    let edge_count = edges.iter().map(Vec::len).sum();
+    let mut idmap = KeyMap::with_capacity(edge_count);
+    let mut ids: Vec<Str> = vec![];
+    let mut parent: Vec<u32> = vec![];
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        let mut r = x;
+        while parent[r as usize] != r {
+            r = parent[r as usize];
+        }
+        while parent[x as usize] != r {
+            let n = parent[x as usize];
+            parent[x as usize] = r;
+            x = n;
+        }
+        r
+    }
+    for chunk in edges {
+        for (a, b) in &chunk {
+            let mut idx = |s: &Str| -> u32 {
+                let k = key128(s.get());
+                let i = ids.len() as u32;
+                match idmap.insert_if_absent(k, i) {
+                    Some(i) => i,
+                    None => {
+                        ids.push(*s);
+                        parent.push(i);
+                        i
+                    }
+                }
+            };
+            let ia = idx(a);
+            let ib = idx(b);
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            if ra != rb {
+                // keep the root as the byte-wise smallest id
+                if ids[ra as usize].get() < ids[rb as usize].get() {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
+                }
+            }
+        }
+    }
+    // person of each linked id: (name key, name)
+    let mut link_person: Vec<(u128, Str)> = Vec::with_capacity(ids.len());
+    for i in 0..ids.len() {
+        let r = find(&mut parent, i as u32) as usize;
+        link_person.push((key128(ids[r].get()), ids[r]));
+    }
+    (idmap, link_person)
+}
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -254,65 +308,8 @@ fn main() {
         });
         *ln_out[ci].lock().unwrap() = v;
     });
-    let mut idmap = KeyMap::with_capacity(1 << 16);
-    let mut ids: Vec<Str> = vec![];
-    let mut parent: Vec<u32> = vec![];
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while parent[r as usize] != r {
-            r = parent[r as usize];
-        }
-        while parent[x as usize] != r {
-            let n = parent[x as usize];
-            parent[x as usize] = r;
-            x = n;
-        }
-        r
-    }
-    for m in &ln_out {
-        let v = m.lock().unwrap();
-        for (a, b) in v.iter() {
-            let mut idx = |s: &Str| -> u32 {
-                let k = key128(s.get());
-                match idmap.get(k) {
-                    Some(i) => i,
-                    None => {
-                        let i = ids.len() as u32;
-                        idmap.insert_if_absent(k, i);
-                        ids.push(*s);
-                        parent.push(i);
-                        i
-                    }
-                }
-            };
-            let ia = idx(a);
-            let ib = idx(b);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                // keep the root as the byte-wise smallest id
-                if ids[ra as usize].get() < ids[rb as usize].get() {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
-            }
-        }
-    }
-    // person of each linked id: (name key, name)
-    let mut link_person: Vec<(u128, Str)> = Vec::with_capacity(ids.len());
-    for i in 0..ids.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        link_person.push((key128(ids[r].get()), ids[r]));
-    }
-    let person_of = |user: &[u8]| -> (u128, Str) {
-        let k = key128(user);
-        match idmap.get(k) {
-            Some(i) => link_person[i as usize],
-            None => (k, Str::of(user)),
-        }
-    };
-    log(&t0, &format!("links: {} ids", ids.len()));
+    let edges = ln_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let links = std::thread::spawn(move || resolve_links(edges));
 
     // ---- events phase A ----
     let ev_chunks = chunks(&ev_maps, CH);
@@ -364,6 +361,14 @@ fn main() {
     });
     log(&t0, "events A");
 
+    let (idmap, link_person) = links.join().unwrap();
+    let person_of = |user: &[u8]| -> (u128, Str) {
+        let k = key128(user);
+        match idmap.get(k) {
+            Some(i) => link_person[i as usize],
+            None => (k, Str::of(user)),
+        }
+    };
     // ---- clicks ----
     let cl_chunks = chunks(&cl_maps, CH);
     let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt).map(|_| Mutex::new((0..NP).map(|_| vec![]).collect())).collect();
@@ -396,9 +401,8 @@ fn main() {
         let mut best: Vec<&EvA> = Vec::with_capacity(n);
         for tv in &ev_a {
             for r in &tv[p] {
-                match tab.get(r.ekey) {
+                match tab.insert_if_absent(r.ekey, best.len() as u32) {
                     None => {
-                        tab.insert_if_absent(r.ekey, best.len() as u32);
                         best.push(r);
                     }
                     Some(i) => {
