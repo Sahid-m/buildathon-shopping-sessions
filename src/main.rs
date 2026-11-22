@@ -770,14 +770,14 @@ fn main() {
         bucket_sort(&ev_c, p, bsh, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc, pool);
-        let evs = &esc.out;
+        let evs = &esc.scat;
         bucket_sort(&cl_c, p, bsh, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.dt().cmp(&b.dt()))
                 .then_with(|| a.cid.get().cmp(b.cid.get()))
         }, csc, pool);
-        let cls = &mut csc.out;
+        let cls = &mut csc.scat;
         // The packed sort keeps equal (pkey, ts) clicks in input order; order those runs by
         // click_id so the dedup below sees copies side by side.
         let mut a = 0;
@@ -1039,39 +1039,38 @@ fn bucket_sort<T: Copy>(
     for w in workers {
         w.release(pool);
     }
-    out.clear();
-    out.reserve(n);
+    // Each bucket is sorted in place (sorted buckets stay where they are in `scat`), so no
+    // second partition-sized buffer is written.
     let mut start = 0;
     for &end in ends.iter() {
-        let b = &scat[start..end];
+        let b = &mut scat[start..end];
         start = end;
         if b.len() <= SMALL {
             // Stable insertion sort by (key, tsoff): ties keep input order, as the packed
             // keys do.
-            let o = out.len();
-            out.extend_from_slice(b);
-            let t = &mut out[o..];
-            for i in 1..t.len() {
-                let v = t[i];
+            for i in 1..b.len() {
+                let v = b[i];
                 let kv = (key(&v), tsoff(&v));
                 let mut j = i;
-                while j > 0 && (key(&t[j - 1]), tsoff(&t[j - 1])) > kv {
-                    t[j] = t[j - 1];
+                while j > 0 && (key(&b[j - 1]), tsoff(&b[j - 1])) > kv {
+                    b[j] = b[j - 1];
                     j -= 1;
                 }
-                t[j] = v;
+                b[j] = v;
             }
             continue;
         }
-        if !sort_bucket(b, &key, &tsoff, tb, bsh, keys, pks, out) {
-            let o = out.len();
-            out.extend_from_slice(b);
-            out[o..].sort_unstable_by(cmp);
+        out.clear();
+        if sort_bucket(b, &key, &tsoff, tb, bsh, keys, pks, out) {
+            b.copy_from_slice(out);
+        } else {
+            b.sort_unstable_by(cmp);
         }
     }
 }
 
 /// Per-thread buffers for `bucket_sort`, reused across partitions to avoid fresh page faults.
+/// `scat` holds the sorted partition; `out` is one bucket's gather buffer.
 struct Scratch<T> {
     scat: Vec<T>,
     out: Vec<T>,
