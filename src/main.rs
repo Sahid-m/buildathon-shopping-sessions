@@ -996,7 +996,7 @@ fn sort_bucket<T: Copy>(
 /// WB records in a small cache-resident buffer; a full buffer is written out as whole,
 /// 64-byte-aligned cache lines with non-temporal stores (no read-for-ownership of the
 /// destination lines, which 256 streams would otherwise miss on).
-const WB: usize = 8; // 8 * 40 B = 320 B = 5 cache lines
+const WB: usize = 16; // 16 * 40 B = 640 B = 10 cache lines
 
 struct Wc<'a> {
     g: &'a mut [Vec<EvA>],
@@ -1031,7 +1031,7 @@ impl<'a> Wc<'a> {
         let dst = unsafe { v.as_mut_ptr().add(len) };
         let mis = dst as usize & 63;
         if mis == 0 {
-            unsafe { stream320(dst as *mut u8, b.as_ptr() as *const u8) };
+            unsafe { stream_wb(dst as *mut u8, b.as_ptr() as *const u8) };
             unsafe { v.set_len(len + WB) };
             self.n[p] = 0;
             return;
@@ -1068,18 +1068,18 @@ impl<'a> Wc<'a> {
 
 /// Copies 320 bytes to a 64-byte-aligned `dst`, bypassing the cache where supported.
 #[inline(always)]
-unsafe fn stream320(dst: *mut u8, src: *const u8) {
+unsafe fn stream_wb(dst: *mut u8, src: *const u8) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
     unsafe {
         use core::arch::x86_64::*;
-        for i in 0..10 {
+        for i in 0..20 {
             let x = _mm256_loadu_si256(src.add(i * 32) as *const __m256i);
             _mm256_stream_si256(dst.add(i * 32) as *mut __m256i, x);
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
     unsafe {
-        std::ptr::copy_nonoverlapping(src, dst, 320);
+        std::ptr::copy_nonoverlapping(src, dst, 640);
     }
 }
 
