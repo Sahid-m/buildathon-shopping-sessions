@@ -73,16 +73,6 @@ impl Cand {
     }
 }
 
-/// A valid click before person resolution, bucketed by user hash.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct ClB {
-    uh: u64,
-    ts: i64,
-    cid: Str,
-    camp: u16,
-}
-
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct EvC {
@@ -365,83 +355,19 @@ fn main() {
         *ln_out[ci].lock().unwrap() = v;
     });
 
-    // ---- union-find + pmap on thread 0, overlapped with click parsing on the others ----
+    // ---- events A (one pass) + clicks, keyed by raw user; union-find on thread 0 first ----
+    // Each event row gives a payload (EvC keyed by user hash, in user partitions) and a dedup
+    // candidate (in event partitions) holding the payload's location.
     let ev_chunks = chunks(&ev_maps, CH);
+    let cl_chunks = chunks(&cl_maps, CH);
     let total_ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let est_ev_per_part = (total_ev_bytes / 85 / nt.max(1) / NP).max(64);
+    let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
+    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
     let total_edges: usize = ln_out.iter().map(|m| m.lock().unwrap().len()).sum();
     let pmap_cap = ((total_edges * 2 + 64) * 2).next_power_of_two().max(1024);
     let mut pmap: Vec<(u64, u64)> = Vec::new();
 
-    let cl_chunks = chunks(&cl_maps, CH);
-    let total_cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
-    let est_cl_per_part = (total_cl_bytes / 55 / nt.max(1) / NP).max(32);
-    let cl_tmp: Vec<Mutex<Vec<ClB>>> =
-        (0..nt).map(|_| Mutex::new(Vec::with_capacity(total_cl_bytes / 55 / nt.max(1) + 64))).collect();
-    let next_cl = AtomicUsize::new(0);
-    let parse_clicks = |t: usize| {
-        let mut tmp = cl_tmp[t].lock().unwrap();
-        loop {
-            let ci = next_cl.fetch_add(1, Ordering::Relaxed);
-            if ci >= cl_chunks.len() {
-                break;
-            }
-            let (fi, s, e) = cl_chunks[ci];
-            let d: &[u8] = &cl_maps[fi][s..e];
-            csv::for_rows::<4, _>(d, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let Some(t) = ts::parse_ts(f[3]) else { return };
-                if t < cws || t >= we {
-                    return;
-                }
-                let Some(camp) = campaigns.get(key128(f[2])) else { return };
-                let uh = hash64(key128(f[1]));
-                tmp.push(ClB { uh, ts: t, cid: Str::of(f[0]), camp: camp as u16 });
-            });
-        }
-    };
-    std::thread::scope(|s| {
-        let pmap_ptr = &mut pmap;
-        let ln_out_ref = &ln_out;
-        let parse_clicks = &parse_clicks;
-        s.spawn(move || {
-            *pmap_ptr = build_pmap(ln_out_ref, total_edges, pmap_cap);
-            parse_clicks(0);
-        });
-        for t in 1..nt {
-            s.spawn(move || parse_clicks(t));
-        }
-    });
-    drop(ln_out);
-    log(&t0, "links + click parse");
-
-    let pmask = pmap.len() - 1;
-    let pshift = 64 - pmap.len().trailing_zeros();
-    let person_of = |h: u64, user: Str| -> (u64, Str) {
-        let h_nz = h | 1;
-        let mut i = (h_nz >> pshift) as usize;
-        loop {
-            let (k, raw) = unsafe { *pmap.get_unchecked(i) };
-            if k == h_nz {
-                let ph = mum(raw ^ 0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9);
-                return (ph, Str(raw));
-            }
-            if k == 0 {
-                return (h, user);
-            }
-            i = (i + 1) & pmask;
-        }
-    };
-    // Lookups come in random order over a table bigger than cache, so callers prefetch the
-    // home slot PF lookups ahead.
-    const PF: usize = 16;
-    let prefetch_person =
-        |h: u64| csv::prefetch(unsafe { pmap.as_ptr().add(((h | 1) >> pshift) as usize) } as *const u8);
-
-    // ---- events A (one pass): payload by person + dedup candidate by event ----
-    // Also scatters this thread's parsed clicks by person first.
     let thb = (nt.next_power_of_two().trailing_zeros()) as u32;
     let cl_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt)
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_cl_per_part)).collect()))
@@ -453,29 +379,25 @@ fn main() {
         .map(|_| Mutex::new((0..NP).map(|_| Vec::with_capacity(est_ev_per_part)).collect()))
         .collect();
     let next_ev = AtomicUsize::new(0);
+    let next_cl = AtomicUsize::new(0);
     std::thread::scope(|s| {
+        let mut pmap_ptr = Some(&mut pmap);
         for t in 0..nt {
-            let (cl_tmp, cl_c, ev_c, ev_k, next_ev, ev_chunks, ev_maps, products) =
-                (&cl_tmp, &cl_c, &ev_c, &ev_k, &next_ev, &ev_chunks, &ev_maps, &products);
-            let (person_of, prefetch_person) = (&person_of, &prefetch_person);
+            let (cl_c, ev_c, ev_k, next_ev, next_cl, ev_chunks, cl_chunks, ev_maps, cl_maps, products, campaigns) = (
+                &cl_c, &ev_c, &ev_k, &next_ev, &next_cl, &ev_chunks, &cl_chunks, &ev_maps, &cl_maps, &products,
+                &campaigns,
+            );
+            let ln_out = &ln_out;
+            let pmap_slot = pmap_ptr.take();
             s.spawn(move || {
-                {
-                    let tmp = std::mem::take(&mut *cl_tmp[t].lock().unwrap());
-                    let mut g = cl_c[t].lock().unwrap();
-                    for i in 0..tmp.len() {
-                        if i + PF < tmp.len() {
-                            prefetch_person(tmp[i + PF].uh);
-                        }
-                        let r = &tmp[i];
-                        let (pkey, _) = person_of(r.uh, Str(0));
-                        g[(pkey >> 56) as usize].push(ClC::new(pkey, r.cid, (r.ts - cws) as u64, r.camp));
-                    }
+                if let Some(pm) = pmap_slot {
+                    *pm = build_pmap(ln_out, total_edges, pmap_cap);
+                    log(&t0, "  pmap built");
                 }
                 let mut ge = ev_c[t].lock().unwrap();
                 let mut gk = ev_k[t].lock().unwrap();
                 let mut ste = wc::Stager::<EvC, 8>::new(NP);
                 let mut stk = wc::Stager::<Cand, 8>::new(NP);
-                let mut batch = [Row::default(); BATCH];
                 loop {
                     let ci = next_ev.fetch_add(1, Ordering::Relaxed);
                     if ci >= ev_chunks.len() {
@@ -483,45 +405,52 @@ fn main() {
                     }
                     let (fi, s, e) = ev_chunks[ci];
                     let d: &[u8] = &ev_maps[fi][s..e];
-                    let mut n = 0usize;
-                    let mut flush = |batch: &[Row], ge: &mut [Vec<EvC>], gk: &mut [Vec<Cand>]| {
-                        for r in batch {
-                            let loc = if r.valid {
-                                let (pk, name) = person_of(r.uh, r.user);
-                                let p = (pk >> 56) as usize;
-                                let idx = (ge[p].len() + ste.pending(p)) as u64;
-                                ste.push(ge, p, EvC { pkey: pk, name, w: r.w });
-                                (idx << (8 + thb)) | ((t as u64) << 8) | p as u64
-                            } else {
-                                LOC_NONE
-                            };
-                            stk.push(gk, (r.eh >> 56) as usize, Cand::new(r.eh, r.ing, loc));
-                        }
-                    };
                     csv::for_rows::<7, _>(d, |f| {
                         if f[0].is_empty() {
                             return;
                         }
                         let r = parse_event(f, products, ws, we, unknown_cat);
-                        if r.valid {
-                            prefetch_person(r.uh);
-                        }
-                        batch[n] = r;
-                        n += 1;
-                        if n == BATCH {
-                            flush(&batch, &mut ge, &mut gk);
-                            n = 0;
-                        }
+                        let loc = if r.valid {
+                            let p = (r.uh >> 56) as usize;
+                            let idx = (ge[p].len() + ste.pending(p)) as u64;
+                            ste.push(&mut ge, p, EvC { pkey: r.uh, name: r.user, w: r.w });
+                            (idx << (8 + thb)) | ((t as u64) << 8) | p as u64
+                        } else {
+                            LOC_NONE
+                        };
+                        stk.push(&mut gk, (r.eh >> 56) as usize, Cand::new(r.eh, r.ing, loc));
                     });
-                    flush(&batch[..n], &mut ge, &mut gk);
                 }
                 ste.finish(&mut ge);
                 stk.finish(&mut gk);
+                drop(ge);
+                drop(gk);
+                let mut g = cl_c[t].lock().unwrap();
+                loop {
+                    let ci = next_cl.fetch_add(1, Ordering::Relaxed);
+                    if ci >= cl_chunks.len() {
+                        break;
+                    }
+                    let (fi, s, e) = cl_chunks[ci];
+                    let d: &[u8] = &cl_maps[fi][s..e];
+                    csv::for_rows::<4, _>(d, |f| {
+                        if f[0].is_empty() || f[1].is_empty() {
+                            return;
+                        }
+                        let Some(t) = ts::parse_ts(f[3]) else { return };
+                        if t < cws || t >= we {
+                            return;
+                        }
+                        let Some(camp) = campaigns.get(key128(f[2])) else { return };
+                        let uh = hash64(key128(f[1]));
+                        g[(uh >> 56) as usize].push(ClC::new(uh, Str::of(f[0]), (t - cws) as u64, camp as u16));
+                    });
+                }
             });
         }
     });
-    drop(cl_tmp);
-    log(&t0, "events A + click scatter");
+    drop(ln_out);
+    log(&t0, "links + events A + clicks");
 
     // ---- events B: dedup candidates, mark every losing copy's payload dead ----
     let bases: Vec<usize> = ev_c
@@ -591,11 +520,64 @@ fn main() {
     drop(dd_tabs);
     log(&t0, "events B");
 
+    // ---- person resolution: move linked users' records to their person's partition ----
+    // pmap is indexed by the top bits of the user hash, so user partition p only probes its
+    // own 1/NP slice of the table, which stays in L2.
+    let pmask = pmap.len() - 1;
+    let pshift = 64 - pmap.len().trailing_zeros();
+    let linked = |h: u64| -> Option<u64> {
+        let h_nz = h | 1;
+        let mut i = (h_nz >> pshift) as usize;
+        loop {
+            let (k, raw) = unsafe { *pmap.get_unchecked(i) };
+            if k == h_nz {
+                return Some(raw);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & pmask;
+        }
+    };
+    let pkey_of = |raw: u64| mum(raw ^ 0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9);
+    let mut ev_c = split_parts(ev_c);
+    let mut cl_c = split_parts(cl_c);
+    let mv_e: Vec<Mutex<Vec<Vec<EvC>>>> = (0..nt).map(|_| Mutex::new((0..NP).map(|_| Vec::new()).collect())).collect();
+    let mv_c: Vec<Mutex<Vec<Vec<ClC>>>> = (0..nt).map(|_| Mutex::new((0..NP).map(|_| Vec::new()).collect())).collect();
+    par_for(nt, NP, |t, p| {
+        let mut me = mv_e[t].lock().unwrap();
+        let mut mc = mv_c[t].lock().unwrap();
+        for w in &ev_c {
+            let mut v = w[p].lock().unwrap();
+            for e in v.iter_mut() {
+                if e.name.0 == 0 {
+                    continue;
+                }
+                if let Some(raw) = linked(e.pkey) {
+                    let pk = pkey_of(raw);
+                    me[(pk >> 56) as usize].push(EvC { pkey: pk, name: Str(raw), w: e.w });
+                    e.name.0 = 0;
+                }
+            }
+        }
+        for w in &cl_c {
+            let mut v = w[p].lock().unwrap();
+            for c in v.iter_mut() {
+                if let Some(raw) = linked(c.pkey) {
+                    let pk = pkey_of(raw);
+                    mc[(pk >> 56) as usize].push(ClC { pkey: pk, cid: c.cid, w: c.w });
+                    c.cid.0 = 0;
+                }
+            }
+        }
+    });
+    ev_c.extend(split_parts(mv_e));
+    cl_c.extend(split_parts(mv_c));
+    log(&t0, "resolve");
+
     drop(pmap);
 
     // ---- phase C: sessions + attribution ----
-    let ev_c = split_parts(ev_c);
-    let cl_c = split_parts(cl_c);
     let ncat = cat_names.len();
     // Bits for a timestamp offset from the click window start (covers events too).
     let tb = 64 - ((we - cws - 1).max(1) as u64).leading_zeros();
@@ -617,7 +599,7 @@ fn main() {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc);
         let evs = &esc.out;
-        bucket_sort(&cl_c, p, |_| true, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
+        bucket_sort(&cl_c, p, |c| c.cid.0 != 0, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.dt().cmp(&b.dt()))
@@ -972,9 +954,7 @@ fn sort_bucket<T: Copy>(
     true
 }
 
-const BATCH: usize = 16;
-
-/// A parsed event row waiting for its person lookup.
+/// A parsed event row.
 #[derive(Clone, Copy, Default)]
 struct Row {
     eh: u64,
@@ -1045,9 +1025,17 @@ fn build_pmap(ln_out: &[Mutex<Vec<(Key, Str, Key, Str)>>], total_edges: usize, c
         }
         r
     }
+    let tuf = Instant::now();
+    const LPF: usize = 12;
     for m in ln_out {
         let v = m.lock().unwrap();
-        for &(ka, sa, kb, sb) in v.iter() {
+        for (ei, &(ka, sa, kb, sb)) in v.iter().enumerate() {
+            if let Some(nx) = v.get(ei + LPF) {
+                let em = idmap.mask;
+                let base = idmap.entries.as_ptr();
+                csv::prefetch(unsafe { base.add(hash64(nx.0) as usize & em) } as *const u8);
+                csv::prefetch(unsafe { base.add(hash64(nx.2) as usize & em) } as *const u8);
+            }
             let next_a = ids.len() as u64;
             let (ia, pres_a) = idmap.get_or_insert(ka, next_a);
             if !pres_a {
@@ -1071,20 +1059,45 @@ fn build_pmap(ln_out: &[Mutex<Vec<(Key, Str, Key, Str)>>], total_edges: usize, c
             }
         }
     }
+    let tloop = tuf.elapsed();
+    // Root string of every id, then the table fill with the home slots prefetched ahead.
+    let n = ids.len();
+    let mut root: Vec<u64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = find(&mut parent, i as u32) as usize;
+        root.push(unsafe { ids.get_unchecked(r).0 });
+    }
     let mask = cap - 1;
     let shift = 64 - cap.trailing_zeros();
     let mut pmap = vec![(0u64, 0u64); cap];
-    for e in &idmap.entries {
-        if !e.k.is_zero() {
-            let r = find(&mut parent, e.v as u32) as usize;
-            let raw = ids[r].0;
-            let h_nz = hash64(e.k) | 1;
+    let mut batch = [(0u64, 0u32); 16];
+    let mut nb = 0usize;
+    let flush = |pmap: &mut Vec<(u64, u64)>, b: &[(u64, u32)]| {
+        for &(h_nz, id) in b {
+            let raw = unsafe { *root.get_unchecked(id as usize) };
             let mut i = (h_nz >> shift) as usize;
             while unsafe { pmap.get_unchecked(i).0 } != 0 {
                 i = (i + 1) & mask;
             }
             unsafe { *pmap.get_unchecked_mut(i) = (h_nz, raw) };
         }
+    };
+    for e in &idmap.entries {
+        if !e.k.is_zero() {
+            let h_nz = hash64(e.k) | 1;
+            csv::prefetch(unsafe { pmap.as_ptr().add((h_nz >> shift) as usize) } as *const u8);
+            csv::prefetch(unsafe { root.as_ptr().add(e.v as usize) } as *const u8);
+            batch[nb] = (h_nz, e.v as u32);
+            nb += 1;
+            if nb == 16 {
+                flush(&mut pmap, &batch);
+                nb = 0;
+            }
+        }
+    }
+    flush(&mut pmap, &batch[..nb]);
+    if std::env::var_os("SS_QUIET").is_none() {
+        eprintln!("  uf loop {:?}, fill {:?}, ids={}", tloop, tuf.elapsed() - tloop, n);
     }
     pmap
 }
