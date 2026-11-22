@@ -131,13 +131,25 @@ impl KeyMap {
         }
     }
 
+    /// Address of the home slot for hash `h` (for prefetching).
+    #[inline(always)]
+    pub fn home_ptr(&self, h: u64) -> *const u8 {
+        unsafe { self.entries.as_ptr().add(h as usize & self.mask) as *const u8 }
+    }
+
     /// Inserts k -> v unless k is present. Returns (existing_or_new_v, was_present).
     #[inline(always)]
     pub fn get_or_insert(&mut self, k: Key, v: u64) -> (u64, bool) {
+        self.get_or_insert_h(k, hash64(k), v)
+    }
+
+    /// `get_or_insert` with `h == hash64(k)` already computed.
+    #[inline(always)]
+    pub fn get_or_insert_h(&mut self, k: Key, h: u64, v: u64) -> (u64, bool) {
         if (self.len + 1) * 2 > self.entries.len() {
             self.grow();
         }
-        let mut i = hash64(k) as usize & self.mask;
+        let mut i = h as usize & self.mask;
         loop {
             let e = unsafe { self.entries.get_unchecked_mut(i) };
             if e.k == k {

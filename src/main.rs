@@ -432,7 +432,9 @@ fn main() {
 
         // Thread 0 builds union-find + compact 16B/slot pmap, then helps with events A
         s.spawn(move || {
-            let mut idmap = KeyMap::with_capacity(total_edges * 2 + 64);
+            // About 1.35 distinct ids per edge in the generated data; the map grows if needed.
+            let mut idmap = KeyMap::with_capacity(total_edges * 7 / 5 + 64);
+            let mut hs: Vec<u64> = Vec::with_capacity(total_edges * 2);
             let mut ids: Vec<Str> = Vec::with_capacity(total_edges * 2);
             let mut parent: Vec<u32> = Vec::with_capacity(total_edges * 2);
             #[inline(always)]
@@ -448,19 +450,31 @@ fn main() {
                 }
                 r
             }
+            // idmap probes are random over a table far bigger than cache: prefetch the home
+            // slots of the edge UF_PF ahead.
+            const UF_PF: usize = 8;
             for m in ln_out_ref {
                 let v = m.lock().unwrap();
-                for &(ka, sa, kb, sb) in v.iter() {
+                for j in 0..v.len() {
+                    if let Some(&(pa, _, pb, _)) = v.get(j + UF_PF) {
+                        csv::prefetch(idmap.home_ptr(hash64(pa)));
+                        csv::prefetch(idmap.home_ptr(hash64(pb)));
+                    }
+                    let (ka, sa, kb, sb) = unsafe { *v.get_unchecked(j) };
                     let next_a = ids.len() as u64;
-                    let (ia, pres_a) = idmap.get_or_insert(ka, next_a);
+                    let ha = hash64(ka);
+                    let (ia, pres_a) = idmap.get_or_insert_h(ka, ha, next_a);
                     if !pres_a {
                         ids.push(sa);
+                        hs.push(ha);
                         parent.push(ia as u32);
                     }
                     let next_b = ids.len() as u64;
-                    let (ib, pres_b) = idmap.get_or_insert(kb, next_b);
+                    let hb = hash64(kb);
+                    let (ib, pres_b) = idmap.get_or_insert_h(kb, hb, next_b);
                     if !pres_b {
                         ids.push(sb);
+                        hs.push(hb);
                         parent.push(ib as u32);
                     }
                     let ra = find(&mut parent, ia as u32);
@@ -475,25 +489,33 @@ fn main() {
                 }
             }
             // Pack into 16B/slot (hash_nz, root_str) table for fast L3-friendly lookups
-            let cap = pmap_cap;
+            log(&t0, "  links unions (t0)");
+            // Load factor 1/4..1/2 over the distinct linked ids.
+            let cap = (idmap.len * 2 + 64).next_power_of_two().max(1024).min(pmap_cap);
             let mask = cap - 1;
             let shift = 64 - cap.trailing_zeros();
             pmap_ptr.resize(cap, (0, 0));
-            for e in &idmap.entries {
-                if !e.k.is_zero() {
-                    let r = find(&mut parent, e.v as u32) as usize;
-                    let raw = ids[r].0;
-                    let h_nz = hash64(e.k) | 1;
-                    let mut i = (h_nz >> shift) as usize;
-                    while unsafe { pmap_ptr.get_unchecked(i).0 } != 0 {
-                        i = (i + 1) & mask;
-                    }
-                    unsafe { *pmap_ptr.get_unchecked_mut(i) = (h_nz, raw) };
-                }
-            }
             drop(idmap);
+            let n = ids.len();
+            const PM_PF: usize = 16;
+            for i in 0..n {
+                if i + PM_PF < n {
+                    let hp = unsafe { *hs.get_unchecked(i + PM_PF) } | 1;
+                    csv::prefetch(unsafe { pmap_ptr.as_ptr().add((hp >> shift) as usize) } as *const u8);
+                }
+                let r = find(&mut parent, i as u32) as usize;
+                let raw = unsafe { ids.get_unchecked(r).0 };
+                let h_nz = unsafe { *hs.get_unchecked(i) } | 1;
+                let mut j = (h_nz >> shift) as usize;
+                while unsafe { pmap_ptr.get_unchecked(j).0 } != 0 {
+                    j = (j + 1) & mask;
+                }
+                unsafe { *pmap_ptr.get_unchecked_mut(j) = (h_nz, raw) };
+            }
+            drop(hs);
             drop(ids);
             drop(parent);
+            log(&t0, "  pmap built (t0)");
 
             // Help process remaining event chunks
             let mut g = ev_a_ref[0].lock().unwrap();
