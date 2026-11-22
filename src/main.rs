@@ -20,11 +20,14 @@ use memmap2::Mmap;
 pub const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
-/// Partition count bounds (log2). The count scales with input so a partition stays near
-/// 40k events: events B's dedup table and phase C's buckets then stay cache-sized.
-const NP_BITS_MIN: u32 = 8;
-const NP_BITS_MAX: u32 = 10;
-const EV_PER_PART: usize = 40_000;
+/// log2 of the event-id partition count (events A scatter, events B dedup). Measured on x86
+/// runners, more parts here cost events A more than they save in events B, at 20M and 60M.
+const NPA_BITS: u32 = 8;
+/// Person partition count bounds (log2) for phase C. The count scales with input so a
+/// partition stays near EV_PER_PART events and its 4096 buckets hold under one person each.
+const NPC_BITS_MIN: u32 = 8;
+const NPC_BITS_MAX: u32 = 10;
+const EV_PER_PART: usize = 20_000;
 const ING_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 const INVALID_DT: u64 = 0x0000_00FF_FFFF_FFFF;
 
@@ -218,21 +221,22 @@ fn chunks(maps: &[Mmap], target: usize) -> Vec<(usize, usize, usize)> {
     out
 }
 
-/// Runs `f(t, i)` for i in 0..n across `nt` threads with dynamic scheduling.
-/// log2 of the partition count: about one partition per EV_PER_PART events (estimated at
-/// ~85 bytes per event line), rounded to the nearest power of two and clamped. The env var
-/// `var` overrides it for benchmarking.
-fn np_bits(total_ev_bytes: usize, var: &str) -> u32 {
-    if let Some(b) = std::env::var(var).ok().and_then(|v| v.parse::<u32>().ok()) {
-        return b.clamp(4, 12);
-    }
+/// Reads a partition-bits override (for benchmarking) from env var `var`.
+fn np_bits_env(var: &str) -> Option<u32> {
+    std::env::var(var).ok().and_then(|v| v.parse::<u32>().ok()).map(|b| b.clamp(4, 12))
+}
+
+/// log2 of the person partition count: about one partition per EV_PER_PART events
+/// (estimated at ~85 bytes per event line), rounded to the nearest power of two and clamped.
+fn npc_bits_for(total_ev_bytes: usize) -> u32 {
     let target = (total_ev_bytes / 85 / EV_PER_PART).max(1) as u64;
     let lo = 63 - target.leading_zeros();
     // Round up when target >= 1.5 * 2^lo.
     let b = if target * 2 >= 3u64 << lo { lo + 1 } else { lo };
-    b.clamp(NP_BITS_MIN, NP_BITS_MAX)
+    b.clamp(NPC_BITS_MIN, NPC_BITS_MAX)
 }
 
+/// Runs `f(t, i)` for i in 0..n across `nt` threads with dynamic scheduling.
 fn par_for<F: Fn(usize, usize) + Sync>(nt: usize, n: usize, f: F) {
     if n == 0 {
         return;
@@ -392,8 +396,8 @@ fn main() {
     // Two independent partitionings, each indexed by the top bits of a 64-bit hash: events A
     // scatters by event id for the events-B dedup (npa parts), and events B and clicks
     // scatter by person for phase C (npc parts).
-    let npa_bits = np_bits(total_ev_bytes, "SS_NPABITS");
-    let npc_bits = np_bits(total_ev_bytes, "SS_NPCBITS");
+    let npa_bits = np_bits_env("SS_NPABITS").unwrap_or(NPA_BITS);
+    let npc_bits = np_bits_env("SS_NPCBITS").unwrap_or_else(|| npc_bits_for(total_ev_bytes));
     let (npa, npc) = (1usize << npa_bits, 1usize << npc_bits);
     let (psha, pshc) = (64 - npa_bits, 64 - npc_bits);
     let est_ev_per_part = (total_ev_bytes / 85 / nt.max(1) / npa).max(64);
