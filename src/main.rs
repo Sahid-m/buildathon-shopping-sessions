@@ -22,7 +22,7 @@ const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const NP: usize = 256;
 /// Event-id partitions for dedup candidates (more of them keep each dedup table in L2).
-const NPK_BITS: u32 = 10;
+const NPK_BITS: u32 = 9;
 const NPK: usize = 1 << NPK_BITS;
 
 #[derive(Clone, Copy, Default)]
