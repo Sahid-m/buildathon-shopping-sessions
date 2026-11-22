@@ -167,6 +167,12 @@ struct CampCell {
     pur: u32,
 }
 
+static PH: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+fn ph(i: usize, t: &mut Instant) {
+    let n = Instant::now();
+    PH[i].fetch_add((n - *t).as_nanos() as u64, Ordering::Relaxed);
+    *t = n;
+}
 fn log(t0: &Instant, msg: &str) {
     if std::env::var_os("SS_QUIET").is_none() {
         eprintln!("[{:8.3} ms] {}", t0.elapsed().as_secs_f64() * 1000.0, msg);
@@ -767,17 +773,19 @@ fn main() {
         let p = order[pi];
         let mut scr = scratch[t].lock().unwrap();
         let (esc, csc) = &mut *scr;
-        bucket_sort(&ev_c, p, bsh, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
+        let mut tt = Instant::now();
+        bucket_sort(0, &ev_c, p, bsh, |e| e.pkey, |e| (e.ts(ws) - cws) as u64, tb, |a, b| {
             (a.pkey, a.dt()).cmp(&(b.pkey, b.dt()))
         }, esc, pool);
         let evs = &esc.scat;
-        bucket_sort(&cl_c, p, bsh, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
+        bucket_sort(2, &cl_c, p, bsh, |c| c.pkey, |c| c.dt() as u64, tb, |a, b| {
             a.pkey
                 .cmp(&b.pkey)
                 .then_with(|| a.dt().cmp(&b.dt()))
                 .then_with(|| a.cid.get().cmp(b.cid.get()))
         }, csc, pool);
         let cls = &mut csc.scat;
+        tt = Instant::now();
         // The packed sort keeps equal (pkey, ts) clicks in input order; order those runs by
         // click_id so the dedup below sees copies side by side.
         let mut a = 0;
@@ -792,6 +800,7 @@ fn main() {
             a = z;
         }
         cls.dedup_by(|a, b| a.pkey == b.pkey && a.dt() == b.dt() && a.cid.get() == b.cid.get());
+        ph(4, &mut tt);
 
         let mut g = touts[t].lock().unwrap();
         let TOut { ud, camp, assisted } = &mut *g;
@@ -919,12 +928,14 @@ fn main() {
             active.clear();
             i = j;
         }
+        ph(5, &mut tt);
     }, |t| {
         // This thread's user_daily rows are complete: write them while others finish.
         let g = touts[t].lock().unwrap();
         pq::write_user_daily(&ud_dir.join(format!("part-{t}.parquet")), &g.ud);
     });
     log(&t0, "phase C"); // includes the user_daily writes
+    eprintln!("PH evscat {} evsort {} clscat {} clsort {} dedup {} sess {}", PH[0].load(Ordering::Relaxed)/1000000, PH[1].load(Ordering::Relaxed)/1000000, PH[2].load(Ordering::Relaxed)/1000000, PH[3].load(Ordering::Relaxed)/1000000, PH[4].load(Ordering::Relaxed)/1000000, PH[5].load(Ordering::Relaxed)/1000000);
 
     // ---- output ----
     let touts: Vec<TOut> = touts.into_iter().map(|m| m.into_inner().unwrap()).collect();
@@ -995,6 +1006,7 @@ fn take_part<T: Copy>(parts: &Parts<T>, p: usize) -> Vec<List<T>> {
 /// gathered in key order. Records with equal (pkey, ts) come out in input order. A bucket whose
 /// keys do not fit 64 bits falls back to a comparison sort with `cmp`.
 fn bucket_sort<T: Copy>(
+    phi: usize,
     parts: &Parts<T>,
     p: usize,
     bsh: u32,
@@ -1005,6 +1017,7 @@ fn bucket_sort<T: Copy>(
     sc: &mut Scratch<T>,
     pool: &Pool,
 ) {
+    let mut tt = Instant::now();
     let bucket = |v: &T| ((key(v) >> bsh) & 4095) as usize;
     let workers = take_part(parts, p);
     let mut ends = vec![0usize; 4096];
@@ -1039,6 +1052,7 @@ fn bucket_sort<T: Copy>(
     for w in workers {
         w.release(pool);
     }
+    ph(phi, &mut tt);
     // Each bucket is sorted in place (sorted buckets stay where they are in `scat`), so no
     // second partition-sized buffer is written.
     let mut start = 0;
@@ -1067,6 +1081,7 @@ fn bucket_sort<T: Copy>(
             b.sort_unstable_by(cmp);
         }
     }
+    ph(phi + 1, &mut tt);
 }
 
 /// Per-thread buffers for `bucket_sort`, reused across partitions to avoid fresh page faults.
