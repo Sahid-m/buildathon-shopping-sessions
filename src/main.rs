@@ -2,6 +2,8 @@
 
 mod csv;
 mod keys;
+#[cfg(test)]
+mod parse_fuzz;
 mod pq;
 mod ts;
 
@@ -293,9 +295,8 @@ fn main() {
         let (fi, s, e) = ln_chunks[ci];
         let d: &[u8] = &ln_maps[fi][s..e];
         let mut v = Vec::with_capacity((e - s) / 22);
-        csv::for_lines(d, |line| {
-            let mut f: [&[u8]; 2] = [&[]; 2];
-            if csv::split::<2>(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+        csv::for_rows::<2, _>(d, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
                 v.push((key128(f[0]), Str::of(f[0]), key128(f[1]), Str::of(f[1])));
             }
         });
@@ -463,9 +464,8 @@ fn main() {
         let (fi, s, e) = cl_chunks[ci];
         let d: &[u8] = &cl_maps[fi][s..e];
         let mut g = cl_b[t].lock().unwrap();
-        csv::for_lines(d, |line| {
-            let mut f: [&[u8]; 4] = [&[]; 4];
-            if !csv::split::<4>(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+        csv::for_rows::<4, _>(d, |f| {
+            if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
             let Some(t) = ts::parse_ts(f[3]) else { return };
@@ -853,9 +853,8 @@ fn process_ev_chunk(
 ) {
     let (fi, s, e) = ev_chunks[ci];
     let d: &[u8] = &ev_maps[fi][s..e];
-    csv::for_lines(d, |line| {
-        let mut f: [&[u8]; 7] = [&[]; 7];
-        if !csv::split::<7>(line, &mut f) || f[0].is_empty() {
+    csv::for_rows::<7, _>(d, |f| {
+        if f[0].is_empty() {
             return;
         }
         let ehash = hash64(key128(f[0]));
